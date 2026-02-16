@@ -17,8 +17,10 @@ Built by [Southern Automation Solutions](https://southernautomationsolutions.com
 1. Copy `PLC_Trend_Tool.exe` to any Windows 10/11 PC
 2. Double-click to run — no installation required
 3. Enter the controller IP address and click **Connect**
-4. Select tags from the built-in tag browser panel
-5. Click **▶ Start Trend** to begin collecting data
+4. Verify the connection details on the PLC Connection page
+5. Navigate to the Trend view using the sidebar
+6. Select tags from the built-in tag browser panel
+7. Click **▶ Start Trend** to begin collecting data
 
 No Python, no drivers, no admin rights required. Single `.exe`, fully portable.
 
@@ -31,6 +33,7 @@ No Python, no drivers, no admin rights required. Single `.exe`, fully portable.
 - Configurable processor slot for multi-slot ControlLogix chassis
 - Validates connection with device identity query
 - Displays device name, firmware revision, and connection details
+- Stays on the connection page after connecting so you can verify status before navigating
 
 ### Live Tag Browser
 - Retrieves full controller and program-scoped tag lists with data types
@@ -42,24 +45,35 @@ No Python, no drivers, no admin rights required. Single `.exe`, fully portable.
 
 ### Real-Time Trending
 - Background polling thread at configurable sample rates (100 ms to 60 sec)
-- Matplotlib chart with auto-scaling, zoom, pan, and home controls
+- Matplotlib chart with auto-scaling, zoom, and horizontal pan
 - Live data table showing current value, min, max, and status per tag
 - Pause/resume display updates while data continues collecting in the background
 - Rolling time window with horizontal scrollbar for history navigation
 - Snap-to-live button to jump back to the latest data
-- **Unlimited data points by default** — trend for hours or days without losing data. An optional memory limit can be configured in Settings to cap storage when running unattended
+- Unlimited data points by default — optional cap configurable in Settings to limit memory usage
+- Charts automatically scale to fill available space at any window size
 
 ### Chart Modes
 - **Overlay mode** — all tags plotted on a shared axis
 - **Isolated mode** — each tag gets its own subplot with synchronized pan/zoom across all subplots
 - **Drag-reorder** — Ctrl+drag subplots to rearrange chart order in isolated mode
+- Tag colors stay locked to each tag regardless of reorder position
 
 ### Chart Customization
 - **Trend Properties dialog** with tabs for X-Axis, Y-Axis, and Display settings
 - Per-tag Y-axis scaling (auto or manual min/max)
 - Configurable time span (30 sec to 1 hour)
 - **Line Properties** — right-click any trace to change color, line width, and line style (solid, dashed, dotted, dash-dot)
-- **Smart cursor** — crosshair with snap-to-nearest-point and value readout
+- In isolated mode, right-click a specific subplot to edit that single tag's line properties
+- **Smart cursor** — crosshair with snap-to-nearest-point and value readout tooltip
+- **Pan is locked to horizontal only** — no accidental vertical scrolling; zoom still allows full region selection
+
+### Click-to-Inspect (Stopped / Historical)
+- When the trend is stopped or viewing an imported file, **left-click anywhere on the chart** to inspect data at that point in time
+- The data table updates to show each tag's value at the clicked timestamp
+- The "Current" column header changes to display the inspected time (e.g., `@ 13:58:22.450`)
+- Works with both stopped live data and imported `.pytrend` files
+- Table automatically returns to live values when a new trend is started
 
 ### Data Export & Import
 - **`.pytrend`** — JSON format with full metadata (PLC IP, controller type, tags, timestamps, sample rate)
@@ -159,7 +173,7 @@ plc-trend-tool/
 ├── assets_data.py         # Embedded assets (base64-encoded logos, icons)
 ├── build.py               # PyInstaller build script
 ├── requirements.txt       # Python dependencies
-├── LICENSE                 # MIT License
+├── LICENSE                # MIT License
 ├── README.md              # This file
 ├── .gitignore
 └── assets/
@@ -175,13 +189,13 @@ plc-trend-tool/
 
 ### Connecting to a PLC
 
-1. Open the app and go to the **PLC Connection** view
+1. Open the app — it starts on the **PLC Connection** view
 2. Enter the PLC's IP address (e.g., `192.168.1.10`)
 3. Select the controller type (ControlLogix, CompactLogix, or Micro800)
 4. Set the processor slot (usually `0` for CompactLogix/Micro800)
 5. Click **Connect**
-
-Once connected, the app automatically fetches the tag list and opens the trend view with the tag panel visible.
+6. Verify the connection status and device information on the connection page
+7. Navigate to the **Trend** view from the sidebar when ready
 
 ### Selecting Tags and Trending
 
@@ -193,21 +207,27 @@ Once connected, the app automatically fetches the tag list and opens the trend v
 
 ### Chart Interaction
 
-- **Pan** — click the pan tool (✥) in the chart toolbar, then click-drag on the chart
-- **Zoom** — click the zoom tool then drag a rectangle to zoom into
+- **Pan** — click the pan tool in the chart toolbar, then click-drag horizontally (vertical panning is disabled)
+- **Zoom** — click the zoom tool then drag a rectangle to zoom into a region
 - **Home** — click the home button to reset the view
 - **Right-click** — access line properties and chart options from the context menu
 - **Ctrl+Drag** (isolated mode) — reorder subplots by dragging them up or down
+- **Left-click** (when stopped) — inspect data at the clicked time; values appear in the table below
+
+### Reviewing Data
+
+After stopping a trend or importing a `.pytrend` file:
+- Use the scrollbar or pan tool to navigate through the data
+- Hover over the chart to see the smart cursor readout
+- **Click** on any point to pin its values in the data table
+- The table's "Current" header updates to show the exact timestamp you clicked
+- Start a new trend to return the table to live values
 
 ### Exporting Data
 
 - Click **`.pytrend`** to save a JSON file with full metadata for later import
 - Click **`CSV`** to save a standard CSV file compatible with Excel or other tools
 - Click **Import** to load a previously saved `.pytrend` file for offline analysis
-
-### Memory Management
-
-By default the app collects data with no point limit — you can trend for as long as needed. If you plan to leave the app running unattended for extended periods, you can set a maximum data point limit in **Settings → Data Storage** to cap memory usage. Options range from 100,000 points (~50 MB) up to 5,000,000 points (~2.5 GB), or Unlimited.
 
 ---
 
@@ -218,9 +238,15 @@ By default the app collects data with no point limit — you can trend for as lo
 - Ensure your PC is on the same subnet (e.g., PLC: `192.168.1.10`, PC: `192.168.1.x`)
 - Check that the PLC's Ethernet module is configured and has a valid IP
 - Try pinging the PLC from a command prompt: `ping 192.168.1.10`
+- Make sure the PLC is not faulted — a faulted controller may connect but fail to return tags
 
 **Tags show "Path segment error"**
 - Verify the processor slot number — usually `0` for CompactLogix, check the physical chassis slot for ControlLogix
+
+**Tag browser shows no tags after connecting**
+- Check that the PLC is not faulted or in a firmware update state
+- Try disconnecting and reconnecting
+- Verify you can browse tags in RSLogix/Studio 5000
 
 **"ModuleNotFoundError" when running from source**
 - Run `pip install -r requirements.txt` to install all dependencies
@@ -231,15 +257,13 @@ By default the app collects data with no point limit — you can trend for as lo
 - Ensure you're on Windows 10 or 11
 - Try rebuilding with `python build.py`
 
-**Chart shows black space or doesn't resize properly**
-- Try clicking the Home button in the chart toolbar
-- Toggle the tag panel off and on to force a layout refresh
-
 ---
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE) — free to use, modify, and distribute.
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+
+---
 
 ## Dependencies & Acknowledgments
 
