@@ -1,0 +1,5 @@
+customtkinter>=5.2.0
+pylogix>=0.8.0
+matplotlib>=3.7.0
+Pillow>=9.0.0
+pyinstaller>=6.0.0
