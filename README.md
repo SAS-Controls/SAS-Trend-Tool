@@ -8,7 +8,7 @@ Built by [Southern Automation Solutions](https://southernautomationsolutions.com
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D6?logo=windows)
-![License](https://img.shields.io/badge/License-Proprietary-gray)
+![License](https://img.shields.io/badge/License-MIT-green)
 
 ---
 
@@ -47,7 +47,7 @@ No Python, no drivers, no admin rights required. Single `.exe`, fully portable.
 - Pause/resume display updates while data continues collecting in the background
 - Rolling time window with horizontal scrollbar for history navigation
 - Snap-to-live button to jump back to the latest data
-- Up to 100,000 data points per session
+- **Unlimited data points by default** — trend for hours or days without losing data. An optional memory limit can be configured in Settings to cap storage when running unattended
 
 ### Chart Modes
 - **Overlay mode** — all tags plotted on a shared axis
@@ -159,6 +159,7 @@ plc-trend-tool/
 ├── assets_data.py         # Embedded assets (base64-encoded logos, icons)
 ├── build.py               # PyInstaller build script
 ├── requirements.txt       # Python dependencies
+├── LICENSE                 # MIT License
 ├── README.md              # This file
 ├── .gitignore
 └── assets/
@@ -204,6 +205,10 @@ Once connected, the app automatically fetches the tag list and opens the trend v
 - Click **`CSV`** to save a standard CSV file compatible with Excel or other tools
 - Click **Import** to load a previously saved `.pytrend` file for offline analysis
 
+### Memory Management
+
+By default the app collects data with no point limit — you can trend for as long as needed. If you plan to leave the app running unattended for extended periods, you can set a maximum data point limit in **Settings → Data Storage** to cap memory usage. Options range from 100,000 points (~50 MB) up to 5,000,000 points (~2.5 GB), or Unlimited.
+
 ---
 
 ## Troubleshooting
@@ -231,6 +236,10 @@ Once connected, the app automatically fetches the tag list and opens the trend v
 - Toggle the tag panel off and on to force a layout refresh
 
 ---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE) — free to use, modify, and distribute.
 
 ## Dependencies & Acknowledgments
 
