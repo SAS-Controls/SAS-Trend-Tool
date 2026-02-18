@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-PLC Trend Tool v1.0
+PLC Trend Tool v1.1
 Southern Automation Solutions
 
 A portable desktop trending application for Allen-Bradley PLCs.
-Reads tag data from ControlLogix, CompactLogix, and Micro800 PLCs
-using pylogix and displays real-time trends with data export.
+Reads tag data from ControlLogix, CompactLogix, Micro800, SLC 500,
+MicroLogix, and PLC-5 controllers using pylogix/pycomm3 and displays
+real-time trends with data export.
 
 Usage (source):
     python plc_trend_tool.py
@@ -15,6 +16,7 @@ Usage (compiled):
 
 Dependencies (for source):
     pip install customtkinter pylogix matplotlib pillow
+    pip install pycomm3  (optional: for SLC 500/MicroLogix/PLC-5 support)
 """
 
 import csv
@@ -113,6 +115,13 @@ except ImportError:
     print("ERROR: pylogix not installed. Run: pip install pylogix")
     sys.exit(1)
 
+# Optional: pycomm3 for SLC 500, MicroLogix, PLC-5 support
+try:
+    from pycomm3 import SLCDriver
+    HAS_PYCOMM3 = True
+except ImportError:
+    HAS_PYCOMM3 = False
+
 try:
     import matplotlib
     matplotlib.use('Agg')
@@ -200,6 +209,38 @@ TRENDABLE_TYPES = {
     "UDINT", "REAL", "LREAL", "BYTE", "WORD", "DWORD", "LWORD",
 }
 
+# SLC 500 / MicroLogix / PLC-5 data file types and structure
+SLC_CONTROLLER_TYPES = {"SLC 500 / MicroLogix", "PLC-5"}
+SLC_PROBE_TYPES = ["N", "F", "B", "T", "C", "R", "ST", "A", "L"]
+SLC_DEFAULT_FILES = {
+    0: "O", 1: "I", 2: "S", 3: "B", 4: "T", 5: "C", 6: "R", 7: "N", 8: "F",
+}
+SLC_FILE_TYPE_NAMES = {
+    "O": "Output", "I": "Input", "S": "Status", "B": "Binary",
+    "T": "Timer", "C": "Counter", "R": "Control", "N": "Integer",
+    "F": "Float", "ST": "String", "A": "ASCII", "L": "Long Integer",
+}
+# Timer/Counter/Control sub-elements — numeric ones are trendable
+SLC_TIMER_SUBS = [
+    (".PRE", "INT", True), (".ACC", "INT", True),
+    (".DN", "BOOL", True), (".EN", "BOOL", True), (".TT", "BOOL", True),
+]
+SLC_COUNTER_SUBS = [
+    (".PRE", "INT", True), (".ACC", "INT", True),
+    (".DN", "BOOL", True), (".CU", "BOOL", True), (".CD", "BOOL", True),
+    (".OV", "BOOL", True), (".UN", "BOOL", True),
+]
+SLC_CONTROL_SUBS = [
+    (".LEN", "INT", True), (".POS", "INT", True),
+    (".EN", "BOOL", True), (".EU", "BOOL", True), (".DN", "BOOL", True),
+    (".EM", "BOOL", True), (".ER", "BOOL", True), (".UL", "BOOL", True),
+    (".IN", "BOOL", True), (".FD", "BOOL", True),
+]
+# Trendable SLC file types (directly readable as numbers, no bit expansion)
+SLC_TRENDABLE_FILE_TYPES = {"F", "L"}
+# Integer-word SLC types — 16-bit, expandable to whole word + individual bits
+SLC_INTEGER_WORD_TYPES = {"O", "I", "S", "N"}
+
 
 def resolve_color(color) -> str:
     """Resolve a (light, dark) tuple to a single string for raw tkinter widgets."""
@@ -267,13 +308,41 @@ class PLCManager:
         self.controller_type = "ControlLogix"
         self.device_name = ""
         self._lock = threading.Lock()
+        self._slc_files = []  # Scanned SLC data file descriptors
 
     def connect(self, ip, slot, controller_type):
         self.ip = ip.strip()
         self.slot = int(slot)
         self.controller_type = controller_type
+        self._slc_files = []
         if not self.ip:
             return False, "IP address is required."
+        # SLC 500 / MicroLogix / PLC-5 — use pycomm3 SLCDriver
+        if controller_type in SLC_CONTROLLER_TYPES:
+            if not HAS_PYCOMM3:
+                return False, "pycomm3 not installed. Run: pip install pycomm3"
+            try:
+                with self._lock:
+                    if self.comm:
+                        try: self.comm.close() if hasattr(self.comm, 'close') else self.comm.Close()
+                        except Exception: pass
+                    self.comm = SLCDriver(self.ip)
+                    self.comm.open()
+                    # Test connection with a read — N7:0 (Integer file 7) always exists
+                    test = self.comm.read("N7:0")
+                    if test.error:
+                        # Fallback: try S:1 (Status file) in case N7 was removed
+                        test2 = self.comm.read("S:1")
+                        if test2.error:
+                            self.connected = False
+                            return False, f"Connection test failed: {test.error}"
+                    self.device_name = f"{controller_type} @ {self.ip}"
+                    self.connected = True
+                    return True, self.device_name
+            except Exception as e:
+                self.connected = False
+                return False, str(e)
+        # ControlLogix / CompactLogix / Micro800 — use pylogix
         try:
             with self._lock:
                 if self.comm:
@@ -297,26 +366,159 @@ class PLCManager:
     def disconnect(self):
         with self._lock:
             if self.comm:
-                try: self.comm.Close()
+                try:
+                    if hasattr(self.comm, 'close'):
+                        self.comm.close()  # pycomm3
+                    else:
+                        self.comm.Close()  # pylogix
                 except Exception: pass
             self.comm = None
             self.connected = False
             self.device_name = ""
+            self._slc_files = []
 
-    def get_tags(self):
+    def _scan_slc_files(self, progress_callback=None):
+        """Probe SLC 500 / MicroLogix / PLC-5 data files to discover what exists.
+        Returns list of dicts: {file_num, file_type, type_name, size}"""
         if not self.connected or not self.comm:
-            return [], {}, "Not connected."
+            return []
+        files_found = []
+        total_probes = 0
+
+        def try_read(addr):
+            """Attempt to read an address; returns True if successful."""
+            nonlocal total_probes
+            total_probes += 1
+            try:
+                result = self.comm.read(addr)
+                return result.error is None
+            except Exception:
+                return False
+
+        def find_file_size(prefix, file_num, max_size=1000):
+            """Binary search for the number of elements in a data file."""
+            # Start with a quick upper bound check
+            if not try_read(f"{prefix}{file_num}:0"):
+                return 0
+            low, high = 1, max_size
+            # Quick exponential probe to find approximate upper bound
+            probe = 1
+            while probe <= max_size:
+                if try_read(f"{prefix}{file_num}:{probe}"):
+                    low = probe + 1
+                    probe *= 2
+                else:
+                    high = probe
+                    break
+                probe = min(probe, max_size)
+            # Binary search between low and high
+            while low < high:
+                mid = (low + high) // 2
+                if try_read(f"{prefix}{file_num}:{mid}"):
+                    low = mid + 1
+                else:
+                    high = mid
+            return low  # low = first failing index = count of valid elements
+
+        # Phase 1: Check default files (0-8) — known types
+        if progress_callback:
+            progress_callback("Scanning default data files (0-8)...")
+        for file_num, file_type in SLC_DEFAULT_FILES.items():
+            addr = f"{file_type}{file_num}:0"
+            if try_read(addr):
+                size = find_file_size(file_type, file_num)
+                type_name = SLC_FILE_TYPE_NAMES.get(file_type, file_type)
+                files_found.append({
+                    "file_num": file_num, "file_type": file_type,
+                    "type_name": type_name, "size": size,
+                })
+
+        # Phase 2: Probe user files (9-255)
+        if progress_callback:
+            progress_callback("Scanning user data files (9-255)...")
+        for file_num in range(9, 256):
+            if progress_callback and file_num % 25 == 0:
+                progress_callback(f"Scanning data files... ({file_num}/255)")
+            # Try common types — N and F first since they're most common user files
+            for file_type in SLC_PROBE_TYPES:
+                addr = f"{file_type}{file_num}:0"
+                if try_read(addr):
+                    size = find_file_size(file_type, file_num)
+                    type_name = SLC_FILE_TYPE_NAMES.get(file_type, file_type)
+                    files_found.append({
+                        "file_num": file_num, "file_type": file_type,
+                        "type_name": type_name, "size": size,
+                    })
+                    break  # Only one type per file number
+
+        files_found.sort(key=lambda f: f["file_num"])
+        logger.info(f"SLC scan complete: {len(files_found)} files found, {total_probes} probes")
+        return files_found
+
+    def get_tags(self, progress_callback=None):
+        """Get tag list. For Logix: returns (ctrl_tags, prog_tags, udt_defs, error).
+        For SLC: returns (slc_file_tags, {}, {}, error) where slc_file_tags mimics tag format."""
+        if not self.connected or not self.comm:
+            return [], {}, {}, "Not connected."
+        # SLC / MicroLogix / PLC-5 — scan data files
+        if self.controller_type in SLC_CONTROLLER_TYPES:
+            try:
+                self._slc_files = self._scan_slc_files(progress_callback)
+                if not self._slc_files:
+                    return [], {}, {}, "No data files found (scan returned empty)"
+                # Convert scanned files into tag-like entries for the tree
+                controller_tags = []
+                for df in self._slc_files:
+                    ft = df["file_type"]
+                    fn = df["file_num"]
+                    sz = df["size"]
+                    tn = df["type_name"]
+                    # Each data file becomes a "struct-like" expandable node
+                    tag_info = {
+                        "name": f"{ft}{fn}",
+                        "dataType": f"{tn} ({sz})",
+                        "trendable": False,  # parent node not directly trendable
+                        "is_struct": 1,  # treat as expandable
+                        "dataTypeValue": 0,
+                        "array": 0,
+                        "size": sz,
+                        # SLC-specific metadata
+                        "_slc_file": True,
+                        "_file_type": ft,
+                        "_file_num": fn,
+                    }
+                    controller_tags.append(tag_info)
+                return controller_tags, {}, {}, None
+            except Exception as e:
+                return [], {}, {}, str(e)
+        # Logix controllers — existing tag list logic
         try:
             with self._lock:
                 result = self.comm.GetTagList()
-                # pylogix stores tags in comm.TagList as a side effect;
-                # result.Value can be None on some firmware even on success
                 tag_list = result.Value
                 if tag_list is None and hasattr(self.comm, 'TagList') and self.comm.TagList:
                     tag_list = self.comm.TagList
+                udt_defs = {}
+                if hasattr(self.comm, 'UDT') and self.comm.UDT:
+                    for type_id, udt in self.comm.UDT.items():
+                        fields = []
+                        for f in udt.Fields:
+                            if getattr(f, 'Internal', False):
+                                continue
+                            if f.TagName.startswith('__'):
+                                continue
+                            fields.append({
+                                "name": f.TagName,
+                                "dataType": f.DataType if f.DataType else "UNKNOWN",
+                                "is_struct": getattr(f, 'Struct', 0),
+                                "dataTypeValue": getattr(f, 'DataTypeValue', 0),
+                                "array": getattr(f, 'Array', 0),
+                                "size": getattr(f, 'Size', 0),
+                            })
+                        udt_defs[type_id] = {"name": udt.Name, "fields": fields}
             if not tag_list:
                 status = result.Status if result else "Unknown"
-                return [], {}, f"No tags returned ({status})"
+                return [], {}, {}, f"No tags returned ({status})"
             controller_tags = []
             program_tags = {}
             for tag in tag_list:
@@ -327,6 +529,10 @@ class PLCManager:
                     "name": tag.TagName,
                     "dataType": tag.DataType if tag.DataType else "UNKNOWN",
                     "trendable": tag.DataType in TRENDABLE_TYPES and is_struct == 0,
+                    "is_struct": is_struct,
+                    "dataTypeValue": getattr(tag, 'DataTypeValue', 0),
+                    "array": getattr(tag, 'Array', 0),
+                    "size": getattr(tag, 'Size', 0),
                 }
                 if tag.TagName.startswith("Program:"):
                     dot_idx = tag.TagName.find(".")
@@ -337,14 +543,32 @@ class PLCManager:
             controller_tags.sort(key=lambda t: t["name"].lower())
             for prog in program_tags:
                 program_tags[prog].sort(key=lambda t: t["name"].lower())
-            return controller_tags, program_tags, None
+            return controller_tags, program_tags, udt_defs, None
         except Exception as e:
-            return [], {}, str(e)
+            return [], {}, {}, str(e)
 
     def read_tags(self, tag_names):
         if not self.connected or not self.comm:
             return {}
         try:
+            # SLC / MicroLogix / PLC-5 — read via pycomm3
+            if self.controller_type in SLC_CONTROLLER_TYPES:
+                with self._lock:
+                    values = {}
+                    for tag in tag_names:
+                        try:
+                            ret = self.comm.read(tag)
+                            if ret.error is None:
+                                val = ret.value
+                                if isinstance(val, bool):
+                                    val = int(val)
+                                values[tag] = val
+                            else:
+                                values[tag] = None
+                        except Exception:
+                            values[tag] = None
+                    return values
+            # Logix controllers — existing pylogix reads
             with self._lock:
                 if len(tag_names) == 1:
                     ret = self.comm.Read(tag_names[0])
@@ -545,6 +769,8 @@ class PLCTrendTool(ctk.CTk):
         self.view_mode = "live"
         self.all_ctrl_tags = []
         self.all_prog_tags = {}
+        self.udt_defs = {}  # UDT type definitions from pylogix
+        self._struct_items = {}  # tree item id -> struct metadata for lazy expansion
 
         # Smart cursor state
         self._cursor_vline = None
@@ -561,6 +787,9 @@ class PLCTrendTool(ctk.CTk):
         self.lines = {}                 # {tag: Line2D}
         self._syncing_xlim = False      # guard for xlim sync callbacks
         self._drag_state = None         # drag-reorder state: {"src_idx": int, "highlight": artist}
+        self._fullscreen_tag = None     # tag name when a single chart is expanded to fill chart area
+        self._xaxis_drag = None         # state for x-axis click-drag panning
+        self._chart_zoom = 1.0          # zoom multiplier for isolated chart heights (1.0 = auto-fit)
 
         # Time window and display state
         self._time_span_seconds = self.settings.get("time_span", 30)
@@ -685,7 +914,6 @@ class PLCTrendTool(ctk.CTk):
         self._nav_buttons = {}
         self._add_nav_button("trend", "\U0001F4C8  Trend View", self._show_trend_view)
         self._add_nav_button("connect", "\U0001F50C  PLC Connection", self._show_connect_view)
-        self._add_nav_button("tags", "\U0001F3F7  Tag Browser", self._show_tags_view)
 
         spacer = ctk.CTkFrame(self._sidebar, fg_color="transparent")
         spacer.pack(fill="both", expand=True)
@@ -771,7 +999,7 @@ class PLCTrendTool(ctk.CTk):
         hdr.pack(fill="x", padx=24, pady=(20, 4))
         ctk.CTkLabel(hdr, text="\U0001F50C  PLC Connection", font=(FONT_FAMILY, FONT_SIZE_HEADING, "bold"),
                      text_color=TEXT_PRIMARY, anchor="w").pack(side="left")
-        ctk.CTkLabel(view, text="Connect to an Allen-Bradley controller to browse tags and start trending.",
+        ctk.CTkLabel(view, text="Connect to an Allen-Bradley controller to browse tags and start trending.\nSupports ControlLogix, CompactLogix, Micro800, SLC 500, MicroLogix, and PLC-5.",
                      font=(FONT_FAMILY, FONT_SIZE_BODY), text_color=TEXT_SECONDARY, anchor="w").pack(fill="x", padx=24, pady=(0, 16))
         self._build_section_header(view, "CONNECTION SETTINGS")
 
@@ -786,9 +1014,12 @@ class PLCTrendTool(ctk.CTk):
         ctk.CTkLabel(row1, text="Controller Type", font=(FONT_FAMILY, FONT_SIZE_BODY, "bold"),
                      text_color=TEXT_PRIMARY, anchor="w", width=140).pack(side="left")
         self.controller_type_var = ctk.StringVar(value="ControlLogix")
-        ctk.CTkOptionMenu(row1, variable=self.controller_type_var, values=["ControlLogix", "CompactLogix", "Micro800"],
+        self._controller_menu = ctk.CTkOptionMenu(row1, variable=self.controller_type_var,
+                          values=["ControlLogix", "CompactLogix", "Micro800", "SLC 500 / MicroLogix", "PLC-5"],
                           font=(FONT_FAMILY, FONT_SIZE_BODY), fg_color=BG_MEDIUM, button_color=SAS_BLUE,
-                          button_hover_color=SAS_BLUE_DARK, dropdown_fg_color=BG_MEDIUM, width=200, height=INPUT_HEIGHT).pack(side="left", padx=(12, 0))
+                          button_hover_color=SAS_BLUE_DARK, dropdown_fg_color=BG_MEDIUM, width=220, height=INPUT_HEIGHT,
+                          command=self._on_controller_type_changed)
+        self._controller_menu.pack(side="left", padx=(12, 0))
 
         # IP Address
         row2 = ctk.CTkFrame(inner, fg_color="transparent")
@@ -809,8 +1040,9 @@ class PLCTrendTool(ctk.CTk):
                                         fg_color=BG_INPUT, border_color=BORDER_COLOR)
         self.slot_entry.insert(0, "0")
         self.slot_entry.pack(side="left", padx=(12, 0))
-        ctk.CTkLabel(row3, text="(Usually 0 for CompactLogix/Micro800)", font=(FONT_FAMILY, FONT_SIZE_SMALL),
-                     text_color=TEXT_MUTED).pack(side="left", padx=(12, 0))
+        self._slot_hint_label = ctk.CTkLabel(row3, text="(Usually 0 for CompactLogix/Micro800)", font=(FONT_FAMILY, FONT_SIZE_SMALL),
+                     text_color=TEXT_MUTED)
+        self._slot_hint_label.pack(side="left", padx=(12, 0))
 
         # Buttons
         btn_row = ctk.CTkFrame(inner, fg_color="transparent")
@@ -910,6 +1142,15 @@ class PLCTrendTool(ctk.CTk):
                                command=self._show_chart_properties, cursor="hand2",
                                highlightthickness=0)
         scale_btn.pack(side="left", padx=(0, 4))
+
+        # New Session button — reset everything
+        new_btn = tk.Button(inner, text="\u21BB New", font=tb_font,
+                            bg=tb_bg, fg=tb_fg, activebackground=tb_hover,
+                            activeforeground=resolve_color(TEXT_PRIMARY),
+                            bd=1, relief="solid", padx=6, pady=0,
+                            command=self._new_session, cursor="hand2",
+                            highlightthickness=0)
+        new_btn.pack(side="left", padx=(0, 4))
 
         # Separator
         tk.Frame(inner, bg=tb_border, width=1).pack(side="left", fill="y", padx=4, pady=2)
@@ -1020,15 +1261,40 @@ class PLCTrendTool(ctk.CTk):
         chart_wrapper.grid_rowconfigure(0, weight=1)
         chart_wrapper.grid_columnconfigure(0, weight=1)
 
+        # Scrollable container for chart (allows vertical scrolling when zoomed)
+        chart_scroll_frame = tk.Frame(chart_wrapper, bg=resolve_color(BG_CARD))
+        chart_scroll_frame.grid(row=0, column=0, sticky="nsew")
+        chart_scroll_frame.grid_rowconfigure(0, weight=1)
+        chart_scroll_frame.grid_columnconfigure(0, weight=1)
+        self._chart_scroll_frame = chart_scroll_frame
+
+        self._chart_scroll_canvas = tk.Canvas(chart_scroll_frame, bg=resolve_color(BG_CARD),
+                                               highlightthickness=0, bd=0)
+        self._chart_scroll_canvas.grid(row=0, column=0, sticky="nsew")
+
+        self._chart_vscroll = tk.Scrollbar(chart_scroll_frame, orient=tk.VERTICAL,
+                                            command=self._chart_scroll_canvas.yview)
+        self._chart_scroll_canvas.configure(yscrollcommand=self._chart_vscroll.set)
+        # vscroll only shown when chart is taller than visible area
+        self._chart_vscroll_visible = False
+
         self.fig = Figure(figsize=(10, 5), dpi=100)
         self._style_chart()
         self.ax = self.fig.add_subplot(111)
         self.axes = [self.ax]
         self._style_chart_axes(self.ax)
 
-        self.canvas = FigureCanvasTkAgg(self.fig, master=chart_wrapper)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self._chart_scroll_canvas)
         self.canvas.get_tk_widget().configure(bg=resolve_color(BG_CARD))
-        self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
+        self._chart_canvas_window = self._chart_scroll_canvas.create_window(
+            (0, 0), window=self.canvas.get_tk_widget(), anchor="nw")
+
+        # Bind scroll canvas resize to update figure sizing
+        self._chart_scroll_canvas.bind("<Configure>", self._on_scroll_canvas_configure)
+
+        # Mouse wheel for vertical chart scrolling when zoomed
+        self.canvas.get_tk_widget().bind("<MouseWheel>", self._on_chart_mousewheel)
+        self._chart_scroll_canvas.bind("<MouseWheel>", self._on_chart_mousewheel)
 
         # Hidden NavigationToolbar (we call its methods via custom buttons)
         _hidden_tb_frame = tk.Frame(chart_wrapper, width=0, height=0)
@@ -1059,6 +1325,38 @@ class PLCTrendTool(ctk.CTk):
             btn.pack(fill="x", pady=1)
             self._add_tooltip(btn, tip)
 
+        # Zoom strip — vertical slider to control isolated chart height
+        zoom_strip = tk.Frame(chart_wrapper, bg=resolve_color(BG_CARD), width=30)
+        zoom_strip.grid(row=0, column=2, sticky="ns", padx=(0, 2), pady=0)
+        zoom_strip.grid_propagate(False)
+        self._zoom_strip = zoom_strip
+
+        zoom_label = tk.Label(zoom_strip, text="\U0001F50D", font=(FONT_FAMILY, 9),
+                               bg=resolve_color(BG_CARD), fg=resolve_color(TEXT_SECONDARY))
+        zoom_label.pack(side="top", pady=(6, 2))
+        self._add_tooltip(zoom_label, "Chart Height Zoom")
+
+        self._chart_zoom_var = tk.DoubleVar(value=1.0)
+        self._chart_zoom_slider = tk.Scale(
+            zoom_strip, from_=5.0, to=1.0, resolution=0.1, orient=tk.VERTICAL,
+            variable=self._chart_zoom_var, command=self._on_chart_zoom_change,
+            showvalue=False, length=120, width=14, sliderlength=16,
+            bg=resolve_color(BG_CARD), fg=resolve_color(TEXT_SECONDARY),
+            troughcolor=resolve_color(BG_INPUT), highlightthickness=0,
+            activebackground=SAS_BLUE, bd=0,
+        )
+        self._chart_zoom_slider.pack(side="top", fill="y", expand=True, padx=4, pady=2)
+        self._add_tooltip(self._chart_zoom_slider, "Drag up to enlarge charts")
+
+        zoom_reset_btn = tk.Button(zoom_strip, text="\u21BA", font=(FONT_FAMILY, 10),
+                                    width=2, bd=0, relief="flat",
+                                    bg=resolve_color(BG_CARD), fg=resolve_color(TEXT_SECONDARY),
+                                    activebackground=resolve_color(BG_CARD_HOVER),
+                                    activeforeground=resolve_color(TEXT_PRIMARY),
+                                    command=self._reset_chart_zoom)
+        zoom_reset_btn.pack(side="bottom", pady=(2, 6))
+        self._add_tooltip(zoom_reset_btn, "Reset to auto-fit")
+
         # Right-click context menu on chart (built dynamically per-click)
         self.canvas.get_tk_widget().bind("<Button-3>", self._show_chart_context_menu)
 
@@ -1078,13 +1376,20 @@ class PLCTrendTool(ctk.CTk):
         # Click-to-inspect: update table with values at clicked time (when stopped)
         self.canvas.mpl_connect("button_press_event", self._on_chart_click_inspect)
 
+        # Double-click to toggle fullscreen on a single chart in isolated mode
+        self.canvas.mpl_connect("button_press_event", self._on_chart_dblclick)
+
+        # X-axis click-drag to pan (works without pan tool selected)
+        self.canvas.mpl_connect("button_press_event", self._on_xaxis_press)
+        self.canvas.mpl_connect("button_release_event", self._on_xaxis_release)
+
         # Auto-fit axes to fill chart area on resize (add='+' preserves matplotlib's own resize handler)
         self.canvas.get_tk_widget().bind("<Configure>", self._on_chart_resize, add="+")
 
         # Time scrollbar below chart
         chart_wrapper.grid_rowconfigure(1, weight=0)
         scroll_frame = tk.Frame(chart_wrapper, bg=resolve_color(BG_CARD), height=18)
-        scroll_frame.grid(row=1, column=0, columnspan=2, sticky="ew")
+        scroll_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
         scroll_frame.grid_propagate(False)
         scroll_frame.grid_columnconfigure(0, weight=1)
         self._scroll_frame = scroll_frame
@@ -1371,6 +1676,12 @@ class PLCTrendTool(ctk.CTk):
         if self._isolated_mode and len(self.axes) > 1:
             menu.add_command(label="\u2195  Reorder Charts (Ctrl + Drag)",
                              state="disabled")
+            menu.add_command(label="\u2194  Double-Click to Expand Chart",
+                             state="disabled")
+            menu.add_separator()
+        elif self._fullscreen_tag:
+            menu.add_command(label="\u2196  Exit Fullscreen (Double-Click)",
+                             command=self._exit_fullscreen)
             menu.add_separator()
 
         menu.add_command(label="\u25B6  Follow Live", command=self._snap_to_live)
@@ -1401,8 +1712,11 @@ class PLCTrendTool(ctk.CTk):
         left = min(55 / fig_w, 0.12)
         right = 1.0 - min(10 / fig_w, 0.03)
         if hspace is None:
-            hspace = 0 if (hasattr(self, '_isolated_mode') and self._isolated_mode
-                           and hasattr(self, 'axes') and len(self.axes) > 1) else 0.15
+            if (hasattr(self, '_isolated_mode') and self._isolated_mode
+                    and hasattr(self, 'axes') and len(self.axes) > 1):
+                hspace = 0
+            else:
+                hspace = 0.15
         self.fig.subplots_adjust(left=left, right=right, top=top, bottom=bottom, hspace=hspace)
 
     def _on_chart_resize(self, event=None):
@@ -1414,6 +1728,94 @@ class PLCTrendTool(ctk.CTk):
             self.canvas.draw_idle()
         except Exception:
             pass
+
+    def _on_scroll_canvas_configure(self, event=None):
+        """When the scrollable container resizes, re-apply zoom sizing."""
+        if not hasattr(self, 'fig') or not hasattr(self, '_chart_scroll_canvas'):
+            return
+        if getattr(self, '_applying_zoom', False):
+            return  # prevent recursion
+        self._apply_chart_zoom()
+
+    def _on_chart_zoom_change(self, value):
+        """Callback from the zoom slider."""
+        self._chart_zoom = float(value)
+        self._apply_chart_zoom()
+
+    def _reset_chart_zoom(self):
+        """Reset zoom to auto-fit."""
+        self._chart_zoom = 1.0
+        self._chart_zoom_var.set(1.0)
+        self._apply_chart_zoom()
+
+    def _apply_chart_zoom(self):
+        """Resize the matplotlib figure based on zoom level and update scroll region."""
+        if not hasattr(self, '_chart_scroll_canvas'):
+            return
+        self._applying_zoom = True
+        try:
+            self._apply_chart_zoom_inner()
+        finally:
+            self._applying_zoom = False
+
+    def _apply_chart_zoom_inner(self):
+        """Inner zoom logic — called inside recursion guard."""
+        sc = self._chart_scroll_canvas
+        visible_w = sc.winfo_width()
+        visible_h = sc.winfo_height()
+        if visible_w < 10 or visible_h < 10:
+            return  # not sized yet
+
+        tags = self._get_ordered_tags() if hasattr(self, '_tag_order') else []
+        n_charts = len(tags) if self._isolated_mode and not self._fullscreen_tag else 1
+        if self._fullscreen_tag:
+            n_charts = 1
+
+        dpi = self.fig.dpi
+
+        if self._chart_zoom <= 1.0 or not self._isolated_mode or n_charts <= 1:
+            # Auto-fit: figure fills visible area exactly
+            fig_h_px = visible_h
+            need_scroll = False
+        else:
+            # Zoomed: each chart gets (visible_h / n_charts) * zoom pixels
+            auto_per_chart = max(visible_h / max(n_charts, 1), 60)
+            desired_per_chart = auto_per_chart * self._chart_zoom
+            fig_h_px = max(int(n_charts * desired_per_chart), visible_h)
+            need_scroll = fig_h_px > visible_h
+
+        fig_w = visible_w / dpi
+        fig_h = fig_h_px / dpi
+
+        self.fig.set_size_inches(fig_w, fig_h)
+        self.canvas.get_tk_widget().configure(width=visible_w, height=fig_h_px)
+
+        # Update scroll region and scrollbar visibility
+        sc.configure(scrollregion=(0, 0, visible_w, fig_h_px))
+        sc.itemconfigure(self._chart_canvas_window, width=visible_w, height=fig_h_px)
+
+        if need_scroll:
+            if not self._chart_vscroll_visible:
+                self._chart_vscroll.grid(row=0, column=1, sticky="ns")
+                self._chart_vscroll_visible = True
+        else:
+            if self._chart_vscroll_visible:
+                self._chart_vscroll.grid_forget()
+                self._chart_vscroll_visible = False
+            sc.yview_moveto(0)  # reset scroll position
+
+        self._apply_chart_margins()
+        try:
+            self.canvas.draw_idle()
+        except Exception:
+            pass
+
+    def _on_chart_mousewheel(self, event):
+        """Handle mousewheel for vertical chart scrolling when zoomed."""
+        if not self._chart_vscroll_visible:
+            return  # no scrolling needed
+        # Windows: event.delta is typically +/-120
+        self._chart_scroll_canvas.yview_scroll(-1 * (event.delta // 120), "units")
 
     def _style_chart_axes(self, ax=None):
         """Style a single axes object. If ax is None, styles all axes."""
@@ -1504,13 +1906,22 @@ class PLCTrendTool(ctk.CTk):
 
     # == DRAG/DROP REORDER FOR ISOLATED SUBPLOTS ==
     def _pan_save_ylims(self, event):
-        """Save Y-axis limits when a pan drag starts so we can restore them."""
-        if event.button == 1 and self.chart_toolbar.mode == 'pan/zoom':
+        """Save Y-axis limits when a pan or isolated-zoom drag starts."""
+        if event.button != 1:
+            return
+        mode = self.chart_toolbar.mode
+        if mode == 'pan/zoom':
+            self._saved_ylims = {id(ax): ax.get_ylim() for ax in self.axes}
+        elif mode == 'zoom rect' and self._isolated_mode and len(self.axes) > 1:
+            # In isolated mode, zoom should only affect X so subplots keep their Y scales
             self._saved_ylims = {id(ax): ax.get_ylim() for ax in self.axes}
 
     def _pan_restore_ylims(self, event):
-        """Restore Y-axis limits after pan to lock panning to horizontal only."""
-        if self._saved_ylims and self.chart_toolbar.mode == 'pan/zoom':
+        """Restore Y-axis limits after pan/zoom to lock vertical axis."""
+        if not self._saved_ylims:
+            return
+        mode = self.chart_toolbar.mode
+        if mode in ('pan/zoom', 'zoom rect'):
             for ax in self.axes:
                 ylim = self._saved_ylims.get(id(ax))
                 if ylim is not None:
@@ -1772,13 +2183,22 @@ class PLCTrendTool(ctk.CTk):
         chart_data = self.trend.get_chart_data()
         self.lines = {}
 
-        if self._isolated_mode and len(tags) > 1:
-            n = len(tags)
+        # Fullscreen mode: show only the expanded tag as a single subplot
+        display_tags = tags
+        if self._fullscreen_tag and self._isolated_mode:
+            if self._fullscreen_tag in tags:
+                display_tags = [self._fullscreen_tag]
+            else:
+                self._fullscreen_tag = None  # tag removed, exit fullscreen
+
+        if self._isolated_mode and len(display_tags) > 1:
+            n = len(display_tags)
             self.axes = []
-            for i, tag in enumerate(tags):
+            for i, tag in enumerate(display_tags):
                 ax = self.fig.add_subplot(n, 1, i + 1)
                 self.axes.append(ax)
-                lp = self._get_line_props(tag, i)
+                tag_idx = tags.index(tag) if tag in tags else i
+                lp = self._get_line_props(tag, tag_idx)
                 times, vals = chart_data.get(tag, ([], []))
                 line, = ax.plot(times, vals, label=tag,
                                 color=lp["color"], linewidth=lp["width"],
@@ -1799,8 +2219,9 @@ class PLCTrendTool(ctk.CTk):
         else:
             self.ax = self.fig.add_subplot(111)
             self.axes = [self.ax]
-            for i, tag in enumerate(tags):
-                lp = self._get_line_props(tag, i)
+            for i, tag in enumerate(display_tags):
+                tag_idx = tags.index(tag) if tag in tags else i
+                lp = self._get_line_props(tag, tag_idx)
                 times, vals = chart_data.get(tag, ([], []))
                 line, = self.ax.plot(times, vals, label=tag,
                                      color=lp["color"], linewidth=lp["width"],
@@ -1809,7 +2230,7 @@ class PLCTrendTool(ctk.CTk):
             self.ax.legend(loc="upper left", fontsize=8, facecolor=face_color,
                            edgecolor=grid_color, labelcolor=text_color)
 
-            for tag in tags:
+            for tag in display_tags:
                 scale = self._tag_scales.get(tag)
                 if scale and not scale.get("auto", True):
                     self.ax.autoscale(enable=False, axis='y')
@@ -1846,7 +2267,7 @@ class PLCTrendTool(ctk.CTk):
             # Autoscale Y only for axes without manual scales
             if self._isolated_mode and len(self.axes) > 1:
                 for i, a in enumerate(self.axes):
-                    tag = tags[i] if i < len(tags) else None
+                    tag = display_tags[i] if i < len(display_tags) else None
                     scale = self._tag_scales.get(tag) if tag else None
                     if scale and not scale.get("auto", True):
                         pass
@@ -1855,7 +2276,7 @@ class PLCTrendTool(ctk.CTk):
                         a.autoscale_view(scalex=False, scaley=True)
             else:
                 has_manual = any(
-                    not self._tag_scales.get(t, {}).get("auto", True) for t in tags
+                    not self._tag_scales.get(t, {}).get("auto", True) for t in display_tags
                 )
                 if not has_manual:
                     self.ax.relim()
@@ -1870,8 +2291,12 @@ class PLCTrendTool(ctk.CTk):
                     a.tick_params(axis="x", labelbottom=False)
                     a.set_xlabel("")
 
-        hspace = 0 if self._isolated_mode and len(tags) > 1 else 0.15
+        if self._isolated_mode and len(display_tags) > 1:
+            hspace = 0
+        else:
+            hspace = 0.15
         self._apply_chart_margins(hspace=hspace)
+        self._apply_chart_zoom()  # size figure to match zoom level
         self.canvas.draw()
         self._update_scrollbar()
         # Connect xlim sync AFTER draw (avoids triggering during build)
@@ -2142,6 +2567,10 @@ class PLCTrendTool(ctk.CTk):
             self._scale_mode = scale_mode_var.get()
             old_iso = self._isolated_mode
             self._isolated_mode = iso_var.get()
+            if old_iso != self._isolated_mode:
+                self._fullscreen_tag = None  # exit fullscreen on mode change
+                if not self._isolated_mode:
+                    self._reset_chart_zoom()  # reset zoom when leaving isolated mode
 
             # Per-tag scales
             for tag, w in tag_widgets.items():
@@ -2347,12 +2776,14 @@ class PLCTrendTool(ctk.CTk):
         except Exception: pass
 
     def _on_chart_click_inspect(self, event):
-        """On left-click when stopped, update the data table to show values at clicked time."""
-        # Only when trend is stopped and not in pan/zoom/drag mode
-        if self.trend.trending:
+        """On left-click when stopped or paused, update the data table to show values at clicked time."""
+        # Only when trend is stopped or paused, and not in pan/zoom/drag mode
+        if self.trend.trending and not self._paused:
             return
         if event.button != 1:
             return
+        if getattr(event, 'dblclick', False):
+            return  # let double-click handler take over
         if self.chart_toolbar.mode:
             return  # pan or zoom active
         if hasattr(event, "guiEvent") and event.guiEvent and (event.guiEvent.state & 0x4):
@@ -2388,6 +2819,103 @@ class PLCTrendTool(ctk.CTk):
         self._inspect_idx = idx
         self._update_live_table()
 
+    def _on_chart_dblclick(self, event):
+        """Double-click a subplot in isolated mode to toggle fullscreen for that tag."""
+        if not event.dblclick or event.button != 1:
+            return
+        if not self._isolated_mode:
+            return
+
+        tags = self._get_ordered_tags()
+        if not tags:
+            return
+
+        if self._fullscreen_tag:
+            # Already in fullscreen — exit back to all subplots
+            self._fullscreen_tag = None
+            self._rebuild_chart()
+            return
+
+        # Need multiple tags to make fullscreen meaningful
+        if len(tags) <= 1:
+            return
+
+        # Find which subplot was double-clicked
+        for i, ax in enumerate(self.axes):
+            if event.inaxes == ax and i < len(tags):
+                self._fullscreen_tag = tags[i]
+                self._rebuild_chart()
+                return
+
+    def _exit_fullscreen(self):
+        """Exit fullscreen mode and return to all subplots."""
+        self._fullscreen_tag = None
+        self._rebuild_chart()
+
+    def _on_xaxis_press(self, event):
+        """Start panning when clicking on a time axis label area."""
+        if event.button != 1 or event.inaxes is not None or not self.axes:
+            return
+        if getattr(event, 'dblclick', False):
+            return  # let double-click handler take over
+        if self.chart_toolbar.mode:
+            return  # don't interfere with toolbar pan/zoom
+        # Check if click is in a time label area (between subplots or below bottom)
+        fig_h = self.fig.get_figheight() * self.fig.dpi
+        fig_w = self.fig.get_figwidth() * self.fig.dpi
+        if fig_h <= 0 or fig_w <= 0:
+            return
+        ref_ax = self.axes[0]
+        bbox = ref_ax.get_position()
+        x_frac = event.x / fig_w
+        if x_frac < bbox.x0 or x_frac > bbox.x1:
+            return  # click is outside the plot area horizontally
+        # Must be below at least one axis (in a label gap), not above all axes
+        y_frac = event.y / fig_h
+        top_ax_top = max(ax.get_position().y1 for ax in self.axes)
+        if y_frac > top_ax_top:
+            return  # clicked above all charts (top margin)
+        self._xaxis_drag = {
+            "start_x_pixel": event.x,
+            "xlim": list(ref_ax.get_xlim()),
+        }
+        self.canvas.get_tk_widget().config(cursor="sb_h_double_arrow")
+        self._xaxis_motion_cid = self.canvas.mpl_connect(
+            "motion_notify_event", self._on_xaxis_motion)
+
+    def _on_xaxis_motion(self, event):
+        """Pan all charts horizontally while dragging on the x-axis area."""
+        if self._xaxis_drag is None or event.x is None:
+            return
+        ref_ax = self.axes[0]
+        try:
+            inv = ref_ax.transData.inverted()
+            start_data = inv.transform((self._xaxis_drag["start_x_pixel"], 0))[0]
+            current_data = inv.transform((event.x, 0))[0]
+        except Exception:
+            return
+        dx = start_data - current_data
+        orig = self._xaxis_drag["xlim"]
+        new_xlim = (orig[0] + dx, orig[1] + dx)
+        for a in self.axes:
+            a.set_xlim(new_xlim)
+        self._follow_live = False
+        try:
+            self.canvas.draw_idle()
+        except Exception:
+            pass
+
+    def _on_xaxis_release(self, event):
+        """End x-axis drag panning."""
+        if self._xaxis_drag is None:
+            return
+        self._xaxis_drag = None
+        if hasattr(self, '_xaxis_motion_cid'):
+            self.canvas.mpl_disconnect(self._xaxis_motion_cid)
+            del self._xaxis_motion_cid
+        self.canvas.get_tk_widget().config(cursor="")
+        self._update_scrollbar()
+
     def _update_storage_info(self):
         """Update the storage info label with current usage."""
         current_pts = self.trend.point_count
@@ -2413,6 +2941,21 @@ class PLCTrendTool(ctk.CTk):
                 text=f"Current: {current_pts:,} points  •  Limit: {limit_str}  •  No active trend data")
 
     # == CONNECTION LOGIC ==
+    def _on_controller_type_changed(self, value):
+        """Update UI hints when controller type dropdown changes."""
+        if value in SLC_CONTROLLER_TYPES:
+            self._slot_hint_label.configure(text="(Not used for SLC/MicroLogix/PLC-5)")
+            self.slot_entry.configure(state="disabled")
+        elif value == "Micro800":
+            self._slot_hint_label.configure(text="(Always 0 for Micro800)")
+            self.slot_entry.configure(state="normal")
+        elif value == "CompactLogix":
+            self._slot_hint_label.configure(text="(Usually 0 for CompactLogix)")
+            self.slot_entry.configure(state="normal")
+        else:
+            self._slot_hint_label.configure(text="(Slot where processor resides)")
+            self.slot_entry.configure(state="normal")
+
     def _connect(self):
         if self.plc.connected:
             self._disconnect()
@@ -2434,9 +2977,14 @@ class PLCTrendTool(ctk.CTk):
         if success:
             self.connect_btn.configure(state="normal", text="Disconnect", fg_color=STATUS_ERROR, hover_color="#b91c1c")
             self.conn_status_label.configure(text="\u2713 Connected", text_color=STATUS_GOOD)
-            self.device_info_label.configure(
-                text=f"Device: {message}\nIP: {self.plc.ip}  |  Slot: {self.plc.slot}  |  Type: {self.plc.controller_type}",
-                text_color=TEXT_PRIMARY)
+            if self.plc.controller_type in SLC_CONTROLLER_TYPES:
+                self.device_info_label.configure(
+                    text=f"Device: {message}\nIP: {self.plc.ip}  |  Type: {self.plc.controller_type}",
+                    text_color=TEXT_PRIMARY)
+            else:
+                self.device_info_label.configure(
+                    text=f"Device: {message}\nIP: {self.plc.ip}  |  Slot: {self.plc.slot}  |  Type: {self.plc.controller_type}",
+                    text_color=TEXT_PRIMARY)
             self._sidebar_status.configure(text=f"\u25CF Connected -- {self.plc.ip}", text_color=STATUS_GOOD)
             # Pre-fetch tags in background so they're ready when user navigates to trend view
             self._fetch_tags()
@@ -2447,15 +2995,35 @@ class PLCTrendTool(ctk.CTk):
     def _disconnect(self):
         if self.trend.trending:
             self._stop_trend()
+        self.trend.clear()
         self.plc.disconnect()
         self.connect_btn.configure(text="Connect", fg_color=SAS_BLUE, hover_color=SAS_BLUE_DARK)
         self.conn_status_label.configure(text="")
         self.device_info_label.configure(text="Not connected -- connect to a PLC to see device information.", text_color=TEXT_MUTED)
         self._sidebar_status.configure(text="\u25CF Disconnected", text_color=STATUS_OFFLINE)
         self._set_tag_placeholder("Connect to a PLC to browse tags")
+        # Clear all session state
         self.selected_tags.clear()
+        self.all_ctrl_tags = []
+        self.all_prog_tags = {}
+        self.udt_defs = {}
+        self._struct_items = {}
+        self.tag_data_types.clear()
+        self._tag_scales.clear()
+        self._line_props.clear()
+        self._tag_order.clear()
+        self._fullscreen_tag = None
+        self._inspect_time = None
+        self._clear_cursor_elements()
+        self.export_json_btn.configure(state="disabled")
+        self.export_csv_btn.configure(state="disabled")
+        self.clear_data_btn.configure(state="disabled")
+        self.point_label.configure(text="")
+        self.view_badge_label.configure(text="", fg=resolve_color(TEXT_MUTED))
+        self._tag_toggle_btn.configure(text="\U0001F3F7 Tags")
         self._update_selected_count()
-        self._sync_tags_to_chart()
+        self._rebuild_chart()
+        self._update_live_table()
 
     # == TAG BROWSER LOGIC ==
     def _set_tag_placeholder(self, text):
@@ -2465,20 +3033,25 @@ class PLCTrendTool(ctk.CTk):
         self.tag_count_label.configure(text="")
 
     def _fetch_tags(self):
-        self._set_tag_placeholder("Loading tags...")
+        is_slc = self.plc.controller_type in SLC_CONTROLLER_TYPES
+        self._set_tag_placeholder("Scanning data files..." if is_slc else "Loading tags...")
         def do_fetch():
             import time
-            # Brief delay to let pylogix connection stabilize after connect
             time.sleep(0.3)
-            ctrl_tags, prog_tags, error = self.plc.get_tags()
-            # Retry once if first attempt failed right after connecting
+            # For SLC, pass a progress callback that updates the placeholder text
+            progress_cb = None
+            if is_slc:
+                def progress_cb(msg):
+                    try: self.after(0, lambda m=msg: self._set_tag_placeholder(m))
+                    except Exception: pass
+            ctrl_tags, prog_tags, udt_defs, error = self.plc.get_tags(progress_callback=progress_cb)
             if error and self.plc.connected:
                 time.sleep(0.5)
-                ctrl_tags, prog_tags, error = self.plc.get_tags()
-            self.after(0, lambda: self._on_tags_fetched(ctrl_tags, prog_tags, error))
+                ctrl_tags, prog_tags, udt_defs, error = self.plc.get_tags(progress_callback=progress_cb)
+            self.after(0, lambda: self._on_tags_fetched(ctrl_tags, prog_tags, udt_defs, error))
         threading.Thread(target=do_fetch, daemon=True).start()
 
-    def _on_tags_fetched(self, ctrl_tags, prog_tags, error):
+    def _on_tags_fetched(self, ctrl_tags, prog_tags, udt_defs, error):
         for item in self.tag_tree.get_children():
             self.tag_tree.delete(item)
         if error:
@@ -2486,42 +3059,387 @@ class PLCTrendTool(ctk.CTk):
             return
         self.all_ctrl_tags = ctrl_tags
         self.all_prog_tags = prog_tags
+        self.udt_defs = udt_defs
         self.tag_data_types = {}
+        self._struct_items = {}  # map tree item id -> (full_tag_path, dataTypeValue, array_size)
         total = 0
         muted = resolve_color(TEXT_MUTED)
         primary = resolve_color(TEXT_PRIMARY)
-        if ctrl_tags:
-            gid = self.tag_tree.insert("", "end", text=f"Controller Tags ({len(ctrl_tags)})", values=("",), open=True, tags=("group",))
+        struct_fg = resolve_color(("#5080B0", "#7AB0D8"))
+        is_slc = self.plc.controller_type in SLC_CONTROLLER_TYPES
+
+        if is_slc:
+            # SLC / MicroLogix / PLC-5 — show scanned data files
+            file_count = len(ctrl_tags)
+            gid = self.tag_tree.insert("", "end", text=f"Data Files ({file_count} found)", values=("",), open=True, tags=("group",))
             for tag in ctrl_tags:
-                self.tag_data_types[tag["name"]] = tag["dataType"]
-                prefix = "\u2611 " if tag["name"] in self.selected_tags else "\u2610 "
-                tt = "trendable" if tag["trendable"] else "disabled"
-                self.tag_tree.insert(gid, "end", text=prefix + tag["name"], values=(tag["dataType"],), tags=(tt, tag["name"]))
+                self._insert_tag_item(gid, tag, tag["name"])
                 total += 1
-        for prog_name in sorted(prog_tags.keys()):
-            tags = prog_tags[prog_name]
-            gid = self.tag_tree.insert("", "end", text=f"{prog_name} ({len(tags)})", values=("",), open=False, tags=("group",))
-            for tag in tags:
-                self.tag_data_types[tag["name"]] = tag["dataType"]
-                prefix = "\u2611 " if tag["name"] in self.selected_tags else "\u2610 "
-                dn = tag["name"].split(".")[-1] if "." in tag["name"] else tag["name"]
-                tt = "trendable" if tag["trendable"] else "disabled"
-                self.tag_tree.insert(gid, "end", text=prefix + dn, values=(tag["dataType"],), tags=(tt, tag["name"]))
-                total += 1
+        else:
+            # Logix controllers — standard tag list
+            if ctrl_tags:
+                gid = self.tag_tree.insert("", "end", text=f"Controller Tags ({len(ctrl_tags)})", values=("",), open=True, tags=("group",))
+                for tag in ctrl_tags:
+                    self.tag_data_types[tag["name"]] = tag["dataType"]
+                    self._insert_tag_item(gid, tag, tag["name"])
+                    total += 1
+            for prog_name in sorted(prog_tags.keys()):
+                tags = prog_tags[prog_name]
+                gid = self.tag_tree.insert("", "end", text=f"{prog_name} ({len(tags)})", values=("",), open=False, tags=("group",))
+                for tag in tags:
+                    self.tag_data_types[tag["name"]] = tag["dataType"]
+                    dn = tag["name"].split(".")[-1] if "." in tag["name"] else tag["name"]
+                    self._insert_tag_item(gid, tag, tag["name"], display_name=dn)
+                    total += 1
         self.tag_tree.tag_configure("group", font=(FONT_FAMILY, FONT_SIZE_BODY, "bold"))
         self.tag_tree.tag_configure("disabled", foreground=muted)
         self.tag_tree.tag_configure("trendable", foreground=primary)
-        self.tag_count_label.configure(text=f"{total} tags")
+        self.tag_tree.tag_configure("struct", foreground=struct_fg)
+        label = f"{total} data files" if is_slc else f"{total} tags"
+        self.tag_count_label.configure(text=label)
         self._update_selected_count()
+        # Bind tree expand/collapse for lazy population
+        self.tag_tree.bind("<<TreeviewOpen>>", self._on_tree_expand)
+        self.tag_tree.bind("<<TreeviewClose>>", self._on_tree_collapse)
+
+    def _insert_tag_item(self, parent, tag, full_path, display_name=None):
+        """Insert a tag into the tree. Struct tags get a dummy child for the expand arrow."""
+        name = display_name or tag["name"]
+        is_struct = tag.get("is_struct", 0)
+        array_count = tag.get("size", 0) if tag.get("array", 0) else 0
+        is_slc_file = tag.get("_slc_file", False)
+
+        if is_slc_file:
+            # SLC data file — always expandable with special styling
+            ft = tag["_file_type"]
+            fn = tag["_file_num"]
+            sz = tag["size"]
+            tn = SLC_FILE_TYPE_NAMES.get(ft, ft)
+            display = f"{ft}{fn} — {tn} ({sz} elements)"
+            item_id = self.tag_tree.insert(parent, "end", text="\u25B6 " + display,
+                                           values=(ft,), tags=("struct",))
+            self._struct_items[item_id] = {
+                "path": f"{ft}{fn}",
+                "dtv": 0,
+                "array": 0,
+                "populated": False,
+                "_slc_file": True,
+                "_file_type": ft,
+                "_file_num": fn,
+                "_file_size": sz,
+            }
+            self.tag_tree.insert(item_id, "end", text="Loading...", values=("",), tags=("_dummy",))
+        elif is_struct:
+            # UDT / struct tag — expandable
+            prefix = "\u25B6 "  # ▶ arrow indicator
+            dt_label = tag["dataType"]
+            if array_count:
+                dt_label = f"{tag['dataType']}[{array_count}]"
+            item_id = self.tag_tree.insert(parent, "end", text=prefix + name,
+                                           values=(dt_label,), tags=("struct",))
+            # Store metadata for lazy expansion
+            self._struct_items[item_id] = {
+                "path": full_path,
+                "dtv": tag.get("dataTypeValue", 0),
+                "array": array_count,
+                "populated": False,
+            }
+            # Dummy child so the expand arrow appears
+            self.tag_tree.insert(item_id, "end", text="Loading...", values=("",), tags=("_dummy",))
+        else:
+            # Atomic / trendable tag
+            prefix = "\u2611 " if full_path in self.selected_tags else "\u2610 "
+            tt = "trendable" if tag.get("trendable", False) else "disabled"
+            self.tag_tree.insert(parent, "end", text=prefix + name,
+                                 values=(tag["dataType"],), tags=(tt, full_path))
+
+    def _on_tree_expand(self, event):
+        """Lazy-load children when a struct/SLC node is expanded."""
+        item = self.tag_tree.focus()
+        if not item or item not in self._struct_items:
+            return
+        info = self._struct_items[item]
+        if info["populated"]:
+            # Just update arrow
+            ct = self.tag_tree.item(item, "text")
+            if ct.startswith("\u25B6 "):
+                self.tag_tree.item(item, text="\u25BC " + ct[2:])
+            return
+        info["populated"] = True
+        # Remove dummy child
+        for child in self.tag_tree.get_children(item):
+            if "_dummy" in self.tag_tree.item(child, "tags"):
+                self.tag_tree.delete(child)
+
+        primary = resolve_color(TEXT_PRIMARY)
+
+        # === SLC Data File expansion ===
+        if info.get("_slc_file"):
+            self._populate_slc_file(item, info)
+        # === SLC element with sub-addresses (Timer, Counter, Control, Binary) ===
+        elif info.get("_slc_element"):
+            self._populate_slc_element(item, info)
+        # === Logix UDT/struct expansion ===
+        elif info.get("atomic_array"):
+            # Array of atomic type — show indexed elements as trendable
+            max_show = min(info["array"], 100)
+            for i in range(max_show):
+                el_path = f"{info['path']}[{i}]"
+                prefix = "\u2611 " if el_path in self.selected_tags else "\u2610 "
+                self.tag_tree.insert(item, "end", text=f"{prefix}[{i}]",
+                                     values=(info.get("dataType", ""),),
+                                     tags=("trendable", el_path))
+                self.tag_data_types[el_path] = info.get("dataType", "UNKNOWN")
+            if info["array"] > 100:
+                self.tag_tree.insert(item, "end", text=f"... ({info['array'] - 100} more)",
+                                     values=("",), tags=("disabled",))
+            self.tag_tree.tag_configure("trendable", foreground=primary)
+        elif info["array"]:
+            # Array of structs — create indexed children
+            max_show = min(info["array"], 100)
+            for i in range(max_show):
+                arr_path = f"{info['path']}[{i}]"
+                arr_item = self.tag_tree.insert(item, "end", text=f"\u25B6 [{i}]",
+                                                values=("",), tags=("struct",))
+                self._struct_items[arr_item] = {
+                    "path": arr_path,
+                    "dtv": info["dtv"],
+                    "array": 0,
+                    "populated": False,
+                }
+                self.tag_tree.insert(arr_item, "end", text="Loading...", values=("",), tags=("_dummy",))
+            if info["array"] > 100:
+                self.tag_tree.insert(item, "end", text=f"... ({info['array'] - 100} more elements)",
+                                     values=("",), tags=("disabled",))
+        else:
+            # Populate UDT members from definition
+            self._populate_udt_members(item, info["path"], info["dtv"])
+        # Update expand arrow text
+        ct = self.tag_tree.item(item, "text")
+        if ct.startswith("\u25B6 "):
+            self.tag_tree.item(item, text="\u25BC " + ct[2:])  # ▼
+
+    def _on_tree_collapse(self, event):
+        """Update arrow when a struct node is collapsed."""
+        item = self.tag_tree.focus()
+        if not item:
+            return
+        ct = self.tag_tree.item(item, "text")
+        if ct.startswith("\u25BC "):
+            self.tag_tree.item(item, text="\u25B6 " + ct[2:])  # ▶
+
+    def _populate_slc_file(self, parent_item, info):
+        """Populate tree children for an SLC data file (e.g., N7, T4, B3)."""
+        ft = info["_file_type"]
+        fn = info["_file_num"]
+        sz = info["_file_size"]
+        primary = resolve_color(TEXT_PRIMARY)
+        struct_fg = resolve_color(("#5080B0", "#7AB0D8"))
+        max_show = min(sz, 200)
+
+        for i in range(max_show):
+            addr = f"{ft}{fn}:{i}"
+            if ft in SLC_TRENDABLE_FILE_TYPES:
+                # Directly trendable only — Float, Long Integer
+                dt_name = "REAL" if ft == "F" else "LINT"
+                prefix = "\u2611 " if addr in self.selected_tags else "\u2610 "
+                self.tag_tree.insert(parent_item, "end", text=f"{prefix}{addr}",
+                                     values=(dt_name,), tags=("trendable", addr))
+                self.tag_data_types[addr] = dt_name
+            elif ft in SLC_INTEGER_WORD_TYPES:
+                # Integer word — expandable to whole word + individual bits
+                child = self.tag_tree.insert(parent_item, "end", text=f"\u25B6 {addr}",
+                                             values=("INT",), tags=("struct",))
+                self._struct_items[child] = {
+                    "path": addr, "dtv": 0, "array": 0, "populated": False,
+                    "_slc_element": True, "_element_type": "INT_WORD",
+                }
+                self.tag_tree.insert(child, "end", text="Loading...", values=("",), tags=("_dummy",))
+            elif ft == "T":
+                # Timer — expandable to sub-elements
+                child = self.tag_tree.insert(parent_item, "end", text=f"\u25B6 {addr}",
+                                             values=("Timer",), tags=("struct",))
+                self._struct_items[child] = {
+                    "path": addr, "dtv": 0, "array": 0, "populated": False,
+                    "_slc_element": True, "_element_type": "T",
+                }
+                self.tag_tree.insert(child, "end", text="Loading...", values=("",), tags=("_dummy",))
+            elif ft == "C":
+                # Counter — expandable to sub-elements
+                child = self.tag_tree.insert(parent_item, "end", text=f"\u25B6 {addr}",
+                                             values=("Counter",), tags=("struct",))
+                self._struct_items[child] = {
+                    "path": addr, "dtv": 0, "array": 0, "populated": False,
+                    "_slc_element": True, "_element_type": "C",
+                }
+                self.tag_tree.insert(child, "end", text="Loading...", values=("",), tags=("_dummy",))
+            elif ft == "R":
+                # Control — expandable to sub-elements
+                child = self.tag_tree.insert(parent_item, "end", text=f"\u25B6 {addr}",
+                                             values=("Control",), tags=("struct",))
+                self._struct_items[child] = {
+                    "path": addr, "dtv": 0, "array": 0, "populated": False,
+                    "_slc_element": True, "_element_type": "R",
+                }
+                self.tag_tree.insert(child, "end", text="Loading...", values=("",), tags=("_dummy",))
+            elif ft == "B":
+                # Binary — expandable to individual bits
+                child = self.tag_tree.insert(parent_item, "end", text=f"\u25B6 {addr}",
+                                             values=("Binary word",), tags=("struct",))
+                self._struct_items[child] = {
+                    "path": addr, "dtv": 0, "array": 0, "populated": False,
+                    "_slc_element": True, "_element_type": "B",
+                }
+                self.tag_tree.insert(child, "end", text="Loading...", values=("",), tags=("_dummy",))
+            elif ft == "ST":
+                # String — not trendable
+                muted = resolve_color(TEXT_MUTED)
+                self.tag_tree.insert(parent_item, "end", text=f"  {addr}",
+                                     values=("STRING",), tags=("disabled",))
+            else:
+                # Unknown type — show as non-trendable
+                muted = resolve_color(TEXT_MUTED)
+                self.tag_tree.insert(parent_item, "end", text=f"  {addr}",
+                                     values=(ft,), tags=("disabled",))
+
+        if sz > 200:
+            self.tag_tree.insert(parent_item, "end", text=f"... ({sz - 200} more elements)",
+                                 values=("",), tags=("disabled",))
+        self.tag_tree.tag_configure("trendable", foreground=primary)
+        self.tag_tree.tag_configure("struct", foreground=struct_fg)
+
+    def _populate_slc_element(self, parent_item, info):
+        """Populate sub-elements for SLC Timer, Counter, Control, Binary, or Integer word."""
+        addr = info["path"]
+        etype = info["_element_type"]
+        primary = resolve_color(TEXT_PRIMARY)
+
+        if etype == "T":
+            subs = SLC_TIMER_SUBS
+        elif etype == "C":
+            subs = SLC_COUNTER_SUBS
+        elif etype == "R":
+            subs = SLC_CONTROL_SUBS
+        elif etype == "B":
+            # Binary bits — 16 bits per word
+            for bit in range(16):
+                bit_addr = f"{addr}/{bit}"
+                prefix = "\u2611 " if bit_addr in self.selected_tags else "\u2610 "
+                self.tag_tree.insert(parent_item, "end", text=f"{prefix}{bit_addr}",
+                                     values=("BOOL",), tags=("trendable", bit_addr))
+                self.tag_data_types[bit_addr] = "BOOL"
+            self.tag_tree.tag_configure("trendable", foreground=primary)
+            return
+        elif etype == "INT_WORD":
+            # Integer word — whole word as decimal + individual bits
+            # First: trendable whole word
+            prefix = "\u2611 " if addr in self.selected_tags else "\u2610 "
+            self.tag_tree.insert(parent_item, "end", text=f"{prefix}{addr}  (word)",
+                                 values=("INT",), tags=("trendable", addr))
+            self.tag_data_types[addr] = "INT"
+            # Then: 16 individual bits
+            for bit in range(16):
+                bit_addr = f"{addr}/{bit}"
+                prefix = "\u2611 " if bit_addr in self.selected_tags else "\u2610 "
+                self.tag_tree.insert(parent_item, "end", text=f"{prefix}{bit_addr}",
+                                     values=("BOOL",), tags=("trendable", bit_addr))
+                self.tag_data_types[bit_addr] = "BOOL"
+            self.tag_tree.tag_configure("trendable", foreground=primary)
+            return
+        else:
+            return
+
+        # Timer / Counter / Control sub-elements
+        for suffix, dt, trendable in subs:
+            sub_addr = f"{addr}{suffix}"
+            if trendable:
+                prefix = "\u2611 " if sub_addr in self.selected_tags else "\u2610 "
+                self.tag_tree.insert(parent_item, "end", text=f"{prefix}{sub_addr}",
+                                     values=(dt,), tags=("trendable", sub_addr))
+                self.tag_data_types[sub_addr] = dt
+            else:
+                muted = resolve_color(TEXT_MUTED)
+                self.tag_tree.insert(parent_item, "end", text=f"  {sub_addr}",
+                                     values=(dt,), tags=("disabled",))
+        self.tag_tree.tag_configure("trendable", foreground=primary)
+
+    def _populate_udt_members(self, parent_item, base_path, data_type_value):
+        """Populate tree children from UDT definition fields."""
+        udt_def = self.udt_defs.get(data_type_value)
+        if not udt_def:
+            self.tag_tree.insert(parent_item, "end", text="(unable to resolve structure)",
+                                 values=("",), tags=("disabled",))
+            return
+        muted = resolve_color(TEXT_MUTED)
+        primary = resolve_color(TEXT_PRIMARY)
+        struct_fg = resolve_color(("#5080B0", "#7AB0D8"))
+        for field in udt_def["fields"]:
+            field_path = f"{base_path}.{field['name']}"
+            is_struct = field.get("is_struct", 0)
+            array_count = field.get("size", 0) if field.get("array", 0) else 0
+
+            if is_struct:
+                dt_label = field["dataType"]
+                if array_count:
+                    dt_label = f"{field['dataType']}[{array_count}]"
+                child = self.tag_tree.insert(parent_item, "end",
+                                             text=f"\u25B6 {field['name']}",
+                                             values=(dt_label,), tags=("struct",))
+                self._struct_items[child] = {
+                    "path": field_path,
+                    "dtv": field.get("dataTypeValue", 0),
+                    "array": array_count,
+                    "populated": False,
+                }
+                self.tag_tree.insert(child, "end", text="Loading...", values=("",), tags=("_dummy",))
+                self.tag_tree.tag_configure("struct", foreground=struct_fg)
+            else:
+                # Atomic member — check if trendable
+                is_trendable = field["dataType"] in TRENDABLE_TYPES
+                if array_count and is_trendable:
+                    # Array of atomic type within UDT — show indexed elements
+                    arr_parent = self.tag_tree.insert(parent_item, "end",
+                                                      text=f"\u25B6 {field['name']}",
+                                                      values=(f"{field['dataType']}[{array_count}]",),
+                                                      tags=("struct",))
+                    self._struct_items[arr_parent] = {
+                        "path": field_path,
+                        "dtv": field.get("dataTypeValue", 0),
+                        "array": array_count,
+                        "populated": False,
+                        "atomic_array": True,  # Flag for atomic array expansion
+                        "dataType": field["dataType"],
+                    }
+                    self.tag_tree.insert(arr_parent, "end", text="Loading...", values=("",), tags=("_dummy",))
+                    self.tag_tree.tag_configure("struct", foreground=struct_fg)
+                elif is_trendable:
+                    prefix = "\u2611 " if field_path in self.selected_tags else "\u2610 "
+                    self.tag_tree.insert(parent_item, "end",
+                                         text=prefix + field["name"],
+                                         values=(field["dataType"],),
+                                         tags=("trendable", field_path))
+                    self.tag_data_types[field_path] = field["dataType"]
+                    self.tag_tree.tag_configure("trendable", foreground=primary)
+                else:
+                    self.tag_tree.insert(parent_item, "end",
+                                         text=f"  {field['name']}",
+                                         values=(field["dataType"],),
+                                         tags=("disabled",))
+                    self.tag_tree.tag_configure("disabled", foreground=muted)
 
     def _on_tag_click(self, event):
         item = self.tag_tree.identify_row(event.y)
         if not item: return
         item_tags = self.tag_tree.item(item, "tags")
-        if "group" in item_tags or "disabled" in item_tags: return
+        if "group" in item_tags or "disabled" in item_tags or "_dummy" in item_tags:
+            return
+        # Struct items — let Treeview's native expand/collapse handle it
+        if "struct" in item_tags:
+            return
+        # Trendable items — toggle selection
         tag_name = None
         for t in item_tags:
-            if t not in ("trendable", "disabled", "group"):
+            if t not in ("trendable", "disabled", "group", "struct", "_dummy"):
                 tag_name = t
                 break
         if not tag_name: return
@@ -2538,29 +3456,31 @@ class PLCTrendTool(ctk.CTk):
     def _filter_tags(self):
         query = self.tag_search_var.get().lower().strip()
         for item in self.tag_tree.get_children(): self.tag_tree.delete(item)
+        self._struct_items = {}
         def matches(tag): return not query or query in tag["name"].lower() or query in tag["dataType"].lower()
         muted = resolve_color(TEXT_MUTED)
         primary = resolve_color(TEXT_PRIMARY)
+        struct_fg = resolve_color(("#5080B0", "#7AB0D8"))
+        is_slc = self.plc.controller_type in SLC_CONTROLLER_TYPES
         fc = [t for t in self.all_ctrl_tags if matches(t)]
         if fc:
-            gid = self.tag_tree.insert("", "end", text=f"Controller Tags ({len(fc)})", values=("",), open=True, tags=("group",))
+            label = f"Data Files ({len(fc)})" if is_slc else f"Controller Tags ({len(fc)})"
+            gid = self.tag_tree.insert("", "end", text=label, values=("",), open=True, tags=("group",))
             for tag in fc:
-                prefix = "\u2611 " if tag["name"] in self.selected_tags else "\u2610 "
-                tt = "trendable" if tag["trendable"] else "disabled"
-                self.tag_tree.insert(gid, "end", text=prefix + tag["name"], values=(tag["dataType"],), tags=(tt, tag["name"]))
-        for pn in sorted(self.all_prog_tags.keys()):
-            fp = [t for t in self.all_prog_tags[pn] if matches(t)]
-            if fp or (query and query in pn.lower()):
-                ts = fp if fp else self.all_prog_tags[pn]
-                gid = self.tag_tree.insert("", "end", text=f"{pn} ({len(ts)})", values=("",), open=bool(query), tags=("group",))
-                for tag in ts:
-                    prefix = "\u2611 " if tag["name"] in self.selected_tags else "\u2610 "
-                    dn = tag["name"].split(".")[-1] if "." in tag["name"] else tag["name"]
-                    tt = "trendable" if tag["trendable"] else "disabled"
-                    self.tag_tree.insert(gid, "end", text=prefix + dn, values=(tag["dataType"],), tags=(tt, tag["name"]))
+                self._insert_tag_item(gid, tag, tag["name"])
+        if not is_slc:
+            for pn in sorted(self.all_prog_tags.keys()):
+                fp = [t for t in self.all_prog_tags[pn] if matches(t)]
+                if fp or (query and query in pn.lower()):
+                    ts = fp if fp else self.all_prog_tags[pn]
+                    gid = self.tag_tree.insert("", "end", text=f"{pn} ({len(ts)})", values=("",), open=bool(query), tags=("group",))
+                    for tag in ts:
+                        dn = tag["name"].split(".")[-1] if "." in tag["name"] else tag["name"]
+                        self._insert_tag_item(gid, tag, tag["name"], display_name=dn)
         self.tag_tree.tag_configure("group", font=(FONT_FAMILY, FONT_SIZE_BODY, "bold"))
         self.tag_tree.tag_configure("disabled", foreground=muted)
         self.tag_tree.tag_configure("trendable", foreground=primary)
+        self.tag_tree.tag_configure("struct", foreground=struct_fg)
 
     def _select_all_visible(self):
         def walk(parent):
@@ -2568,7 +3488,7 @@ class PLCTrendTool(ctk.CTk):
                 tags = self.tag_tree.item(item, "tags")
                 if "trendable" in tags:
                     for t in tags:
-                        if t not in ("trendable", "disabled", "group"):
+                        if t not in ("trendable", "disabled", "group", "struct", "_dummy"):
                             self.selected_tags.add(t)
                             ct = self.tag_tree.item(item, "text")
                             if ct.startswith("\u2610 "): self.tag_tree.item(item, text="\u2611 " + ct[2:])
@@ -2640,6 +3560,7 @@ class PLCTrendTool(ctk.CTk):
         self.trend.start(tags, rate)
         self.view_mode = "live"
         self._inspect_time = None  # clear click-inspect so table shows live values
+        self._fullscreen_tag = None  # exit fullscreen on new trend
 
         # Rebuild chart to reset axes for fresh data collection
         self._rebuild_chart()
@@ -2724,9 +3645,9 @@ class PLCTrendTool(ctk.CTk):
                     any_data = True
             if any_data:
                 self.ax.relim()
-                # Check for manual Y scale
+                # Check for manual Y scale (only for tags currently displayed)
                 manual_ylim = None
-                for tag in self.trend.tags:
+                for tag in self.lines:
                     scale = self._tag_scales.get(tag)
                     if scale and not scale.get("auto", True):
                         manual_ylim = (scale["min"], scale["max"])
@@ -2870,6 +3791,69 @@ class PLCTrendTool(ctk.CTk):
         self.pause_btn.pack(side="left", before=self.stop_btn, padx=(0, 2))
         self.view_badge_label.configure(text="\u25CF LIVE", fg=STATUS_GOOD)
 
+    def _new_session(self):
+        """Reset everything — like closing and reopening the app.
+        Stops any active trend, clears all data, tags, and chart state.
+        If still connected to a PLC, reloads the tag list fresh."""
+        # Stop active trend if running
+        if self.trend.trending:
+            self.trend.stop()
+            if self.trend_thread:
+                self.trend_thread.join(timeout=3)
+                self.trend_thread = None
+            if self.chart_update_timer:
+                self.after_cancel(self.chart_update_timer)
+                self.chart_update_timer = None
+
+        # Clear trend data
+        self.trend.clear()
+
+        # Clear all tag selections and chart state
+        self.selected_tags.clear()
+        self.tag_data_types.clear()
+        self._tag_scales.clear()
+        self._line_props.clear()
+        self._tag_order.clear()
+        self._fullscreen_tag = None
+        self._inspect_time = None
+        self._paused = False
+        self._chart_zoom = 1.0
+        self._clear_cursor_elements()
+        self.view_mode = "live"
+
+        # Clear stored tag lists
+        self.all_ctrl_tags = []
+        self.all_prog_tags = {}
+        self.udt_defs = {}
+        self._struct_items = {}
+
+        # Reset toolbar buttons
+        self.stop_btn.pack_forget()
+        self.pause_btn.pack_forget()
+        self.resume_btn.pack_forget()
+        self.start_btn.pack(side="left", padx=(0, 6))
+        self.start_btn.configure(state="disabled")
+        self.export_json_btn.configure(state="disabled")
+        self.export_csv_btn.configure(state="disabled")
+        self.clear_data_btn.configure(state="disabled")
+        self.point_label.configure(text="")
+        self.view_badge_label.configure(text="", fg=resolve_color(TEXT_MUTED))
+        self._tag_toggle_btn.configure(text="\U0001F3F7 Tags")
+        if hasattr(self, "_storage_info_label"):
+            self._update_storage_info()
+
+        # Rebuild chart (empty)
+        self._rebuild_chart()
+        self._update_live_table()
+
+        # Reset tag browser and reload if connected
+        if self.plc.connected:
+            self._sidebar_status.configure(text=f"\u25CF Connected -- {self.plc.ip}", text_color=STATUS_GOOD)
+            self._fetch_tags()
+        else:
+            self._set_tag_placeholder("Connect to a PLC to browse tags")
+            self._sidebar_status.configure(text="\u25CF Disconnected", text_color=STATUS_OFFLINE)
+
     def _stop_trend(self):
         self.trend.stop()
         if self.trend_thread:
@@ -2928,6 +3912,7 @@ class PLCTrendTool(ctk.CTk):
         self.trend.clear()
         self._clear_cursor_elements()
         self._inspect_time = None
+        self._fullscreen_tag = None
         self._tag_scales = {}
         self._rebuild_chart()
         self._update_live_table()
@@ -2980,6 +3965,7 @@ class PLCTrendTool(ctk.CTk):
                 if tag not in self.tag_data_types: self.tag_data_types[tag] = "---"
                 if tag not in self._tag_scales:
                     self._tag_scales[tag] = {"auto": True, "min": 0, "max": 100}
+            self._fullscreen_tag = None
             self._rebuild_chart()
             self._update_live_table()
             self.view_badge_label.configure(text="\U0001F4C2 HISTORICAL", fg=SAS_BLUE_LIGHT)
@@ -3059,6 +4045,7 @@ class PLCTrendTool(ctk.CTk):
         if self.all_ctrl_tags:
             self.tag_tree.tag_configure("disabled", foreground=resolve_color(TEXT_MUTED))
             self.tag_tree.tag_configure("trendable", foreground=resolve_color(TEXT_PRIMARY))
+            self.tag_tree.tag_configure("struct", foreground=resolve_color(("#5080B0", "#7AB0D8")))
 
     # == SETTINGS PERSISTENCE ==
     def _restore_settings(self):
@@ -3066,7 +4053,9 @@ class PLCTrendTool(ctk.CTk):
         if self.settings.get("last_slot") is not None:
             self.slot_entry.delete(0, "end")
             self.slot_entry.insert(0, str(self.settings["last_slot"]))
-        if self.settings.get("last_controller"): self.controller_type_var.set(self.settings["last_controller"])
+        if self.settings.get("last_controller"):
+            self.controller_type_var.set(self.settings["last_controller"])
+            self._on_controller_type_changed(self.settings["last_controller"])
         if self.settings.get("sample_rate"): self.rate_var.set(self.settings["sample_rate"])
 
     def _save_current_settings(self):
