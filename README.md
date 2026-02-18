@@ -2,7 +2,10 @@
 
 **Real-Time Tag Trending for Allen-Bradley PLCs**
 
-A portable Windows desktop application for trending PLC tag data in real time. Connects to ControlLogix, CompactLogix, and Micro800 controllers via Ethernet/IP using [pylogix](https://github.com/dmroeder/pylogix), discovers tags automatically, and charts live values with full data export capability.
+A portable Windows desktop application for trending PLC tag data in real time. Connects to ControlLogix, CompactLogix, Micro800, SLC 500, MicroLogix, and PLC-5 controllers via Ethernet/IP and charts live values with full data export capability.
+
+- **ControlLogix / CompactLogix / Micro800** — automatic tag discovery via [pylogix](https://github.com/dmroeder/pylogix)
+- **SLC 500 / MicroLogix / PLC-5** — automatic data file scanning via [pycomm3](https://github.com/ottowayi/pycomm3)
 
 Built by [Southern Automation Solutions](https://southernautomationsolutions.com) — Valdosta, GA
 
@@ -26,17 +29,39 @@ No Python, no drivers, no admin rights required. Single `.exe`, fully portable.
 
 ---
 
+## Supported Controllers
+
+| Controller Family | Models | Tag Discovery | Library |
+|---|---|---|---|
+| **ControlLogix** | 1756-L6x, L7x, L8x (5x80) | ✅ Full tag list + UDTs/AOIs | pylogix |
+| **CompactLogix** | 1769-L1x, L2x, L3x, 5370, 5380 | ✅ Full tag list + UDTs/AOIs | pylogix |
+| **Micro800** | Micro820, Micro850 | ✅ Tag list | pylogix |
+| **SLC 500** | 5/03, 5/04, 5/05 (Ethernet) | ✅ Auto data file scan | pycomm3 |
+| **MicroLogix** | 1100, 1200, 1400, 1500 | ✅ Auto data file scan | pycomm3 |
+| **PLC-5** | PLC-5/E series (Ethernet) | ✅ Auto data file scan | pycomm3 |
+
+> SLC 500, MicroLogix, and PLC-5 require an Ethernet port on the controller. Serial-only models are not supported.
+
+---
+
 ## Features
 
 ### PLC Connection
-- Supports Allen-Bradley **ControlLogix**, **CompactLogix**, and **Micro800** controllers
+- Supports Allen-Bradley **ControlLogix**, **CompactLogix**, **Micro800**, **SLC 500**, **MicroLogix**, and **PLC-5** controllers
 - Configurable processor slot for multi-slot ControlLogix chassis
-- Validates connection with device identity query
+- Validates connection with device identity query (Logix) or test read (SLC)
 - Displays device name, firmware revision, and connection details
 - Stays on the connection page after connecting so you can verify status before navigating
 
 ### Live Tag Browser
-- Retrieves full controller and program-scoped tag lists with data types
+- **Logix controllers:** Retrieves full controller and program-scoped tag lists with data types, including UDT and AOI expansion
+- **SLC 500 / MicroLogix / PLC-5:** Automatically scans all 256 data files to discover what exists — no manual address entry needed
+  - Probes default files (0–8) and user-created files (9–255) using typed probes (N, F, B, T, C, R, ST, A, L) to accurately detect only files that exist in the program
+  - Integer words (N, O, I, S files) are expandable — trend the whole word as a decimal value or expand to select individual bits (/0 through /15)
+  - Binary words (B files) expand to individual bits (B3:0/0 through B3:0/15)
+  - Timer, Counter, and Control elements expand to show sub-elements (.ACC, .PRE, .DN, etc.)
+  - Float (F) and Long Integer (L) files display directly as trendable values
+  - Scan results cached per session — reconnecting to the same PLC is instant
 - Search and filter tags by name or data type
 - Checkbox selection with Select All / Clear controls
 - **Tags panel is embedded in the trend view** — select tags and watch the chart update in real time, before or during a trend
@@ -52,6 +77,12 @@ No Python, no drivers, no admin rights required. Single `.exe`, fully portable.
 - Snap-to-live button to jump back to the latest data
 - Unlimited data points by default — optional cap configurable in Settings to limit memory usage
 - Charts automatically scale to fill available space at any window size
+
+### Session Management
+- **↻ New** button on the toolbar resets the entire session — clears all trend data, selected tags, chart state, and tag scales as if the app was closed and reopened
+- If still connected to a PLC, the tag browser reloads automatically after reset
+- Disconnecting from a PLC also performs a full session reset — no stale data carries over when connecting to a different controller
+- Import/export preserves session data for offline review
 
 ### Chart Modes
 - **Overlay mode** — all tags plotted on a shared axis
@@ -116,10 +147,13 @@ This installs:
 | Package | Version | Purpose |
 |---------|---------|---------|
 | `customtkinter` | ≥ 5.2.0 | Modern themed UI framework |
-| `pylogix` | ≥ 0.8.0 | Allen-Bradley PLC communication via Ethernet/IP |
+| `pylogix` | ≥ 0.8.0 | ControlLogix / CompactLogix / Micro800 communication |
+| `pycomm3` | ≥ 1.2.0 | SLC 500 / MicroLogix / PLC-5 communication |
 | `matplotlib` | ≥ 3.7.0 | Chart rendering and interactive plotting |
 | `Pillow` | ≥ 9.0.0 | Image handling for logos and icons |
 | `pyinstaller` | ≥ 6.0.0 | Builds standalone Windows executable |
+
+> **Note:** `pycomm3` is optional for running from source — the app works without it but SLC/MicroLogix/PLC-5 support will be unavailable. However, **it must be installed before building the .exe** if you want SLC support included in the compiled application. PyInstaller bundles whatever is installed at build time.
 
 ### Run from Source
 
@@ -137,8 +171,11 @@ The included build script handles PyInstaller configuration, asset bundling, and
 
 ```bash
 pip install -r requirements.txt
+pip install pycomm3    # Required for SLC 500/MicroLogix/PLC-5 support in the .exe
 python build.py
 ```
+
+> **Important:** If `pycomm3` is not installed when you build, the .exe will still work for ControlLogix/CompactLogix/Micro800 — but SLC 500, MicroLogix, and PLC-5 connections will show an error. Install it before building to include full controller support.
 
 The executable is created at:
 
@@ -159,9 +196,10 @@ Copy the `.exe` to a USB drive — it runs standalone on any Windows 10/11 machi
 
 ### Build Notes
 
-- The resulting `.exe` is typically 20–30 MB (CustomTkinter + matplotlib)
+- The resulting `.exe` is typically 25–35 MB (CustomTkinter + matplotlib + pycomm3)
 - No external files or DLLs are needed — everything is bundled
 - Assets are embedded in `assets_data.py` as base64, so the app is fully self-contained even without the `assets/` folder
+- `pycomm3` is automatically detected and bundled by PyInstaller if installed — no extra configuration needed
 
 ---
 
@@ -190,11 +228,16 @@ plc-trend-tool/
 ### Connecting to a PLC
 
 1. Open the app — it starts on the **PLC Connection** view
-2. Enter the PLC's IP address (e.g., `192.168.1.10`)
-3. Select the controller type (ControlLogix, CompactLogix, or Micro800)
-4. Set the processor slot (usually `0` for CompactLogix/Micro800)
+2. Select the controller type from the dropdown:
+   - **ControlLogix** — for any ControlLogix chassis (set the processor slot)
+   - **CompactLogix** — slot is usually `0`
+   - **Micro800** — Micro820/850 with Ethernet
+   - **SLC 500 / MicroLogix** — SLC 500, MicroLogix 1100/1200/1400/1500 (slot is not used)
+   - **PLC-5** — PLC-5 E-series with Ethernet (slot is not used)
+3. Enter the PLC's IP address (e.g., `192.168.1.10`)
+4. Set the processor slot if applicable
 5. Click **Connect**
-6. Verify the connection status and device information on the connection page
+6. For Logix controllers, the tag list loads automatically. For SLC/MicroLogix/PLC-5, a data file scan runs automatically (typically 3–10 seconds) to discover all available data files
 7. Navigate to the **Trend** view from the sidebar when ready
 
 ### Selecting Tags and Trending
@@ -204,6 +247,26 @@ plc-trend-tool/
 3. Adjust the sample rate from the toolbar dropdown
 4. Click **▶ Start Trend** to begin data collection
 5. Tags can be added or removed while the trend is running — new tags start collecting on the next poll cycle (historical data won't exist for newly added tags)
+
+### SLC / MicroLogix Tag Browser
+
+The tag browser for SLC-type controllers organizes data by file type and number. Each data file appears as an expandable node showing its type and size.
+
+**Integer words (N, O, I, S files)** are expandable with two levels of access:
+- Click the expand arrow (▶) to see the word-level checkbox and individual bit checkboxes
+- The first entry (marked "word") trends the whole integer as a decimal number
+- Entries `/0` through `/15` trend individual bits as BOOL values
+- You can trend both the whole word and individual bits simultaneously
+
+**Binary words (B files)** expand to show 16 individual bit checkboxes (`/0` through `/15`).
+
+**Timers, Counters, and Controls** expand to show their sub-elements (`.ACC`, `.PRE`, `.DN`, `.EN`, etc.) with trendable numeric values and status bits.
+
+**Float (F) and Long Integer (L) files** show directly as trendable values without expansion.
+
+### Starting a New Session
+
+Click the **↻ New** button on the toolbar to completely reset the application state. This clears all trend data, selected tags, chart lines, and custom settings (scales, colors, line styles). If you're still connected to a PLC, the tag browser reloads fresh. Use this when switching between PLCs or starting a clean trend without leftover data from a previous session.
 
 ### Chart Interaction
 
@@ -240,6 +303,17 @@ After stopping a trend or importing a `.pytrend` file:
 - Try pinging the PLC from a command prompt: `ping 192.168.1.10`
 - Make sure the PLC is not faulted — a faulted controller may connect but fail to return tags
 
+**SLC 500 / MicroLogix / PLC-5 won't connect**
+- Make sure `pycomm3` was installed before the .exe was built (see Build Steps above)
+- The controller must have an Ethernet port — serial-only models (e.g., MicroLogix 1000) are not supported
+- Check that no other application (RSLinx, FactoryTalk) has an exclusive connection to the controller
+- The data file scan probes N7:0 to verify the connection — if the default Integer file was removed from the program, the scan may fail on initial test but will still discover other files
+
+**Data file scan shows fewer files than expected (SLC/MicroLogix)**
+- Only files that actually exist in the PLC program are shown — the scanner uses typed probes (N, F, B, T, C, R, ST, A, L) to verify each file, so empty or non-existent files are excluded
+- The scanner does not probe Output (O) or Input (I) types for user files 9–255, as the SLC output/input image table allows reads against non-existent file numbers, which would produce false positives
+- Files above #255 are not scanned (SLC limit)
+
 **Tags show "Path segment error"**
 - Verify the processor slot number — usually `0` for CompactLogix, check the physical chassis slot for ControlLogix
 
@@ -247,6 +321,10 @@ After stopping a trend or importing a `.pytrend` file:
 - Check that the PLC is not faulted or in a firmware update state
 - Try disconnecting and reconnecting
 - Verify you can browse tags in RSLogix/Studio 5000
+
+**Old tags still showing on chart after switching PLCs**
+- Click the **↻ New** button on the toolbar to fully reset the session before connecting to a different controller
+- Alternatively, disconnect first — disconnecting now performs a full session reset automatically
 
 **"ModuleNotFoundError" when running from source**
 - Run `pip install -r requirements.txt` to install all dependencies
@@ -267,7 +345,8 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 ## Dependencies & Acknowledgments
 
-- [pylogix](https://github.com/dmroeder/pylogix) — Allen-Bradley PLC communication
+- [pylogix](https://github.com/dmroeder/pylogix) — ControlLogix / CompactLogix / Micro800 communication
+- [pycomm3](https://github.com/ottowayi/pycomm3) — SLC 500 / MicroLogix / PLC-5 communication
 - [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter) — Modern tkinter UI framework
 - [matplotlib](https://matplotlib.org/) — Scientific plotting library
 - [Pillow](https://python-pillow.org/) — Python Imaging Library
