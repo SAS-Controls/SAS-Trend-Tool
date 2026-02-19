@@ -782,6 +782,7 @@ class PLCTrendTool(ctk.CTk):
         # Chart state
         self._tag_scales = {}           # {tag: {"auto": True, "min": 0, "max": 100}}
         self._line_props = {}           # {tag: {"color": str, "width": float, "style": str}}
+        self._chart_bg = {}             # {tag: color_hex} per-chart background color overrides
         self._tag_order = []            # display order of tags in isolated mode
         self.axes = []                  # list of axes (single subplot)
         self.lines = {}                 # {tag: Line2D}
@@ -1283,6 +1284,7 @@ class PLCTrendTool(ctk.CTk):
         self.ax = self.fig.add_subplot(111)
         self.axes = [self.ax]
         self._style_chart_axes(self.ax)
+        self._apply_chart_bg()
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=self._chart_scroll_canvas)
         self.canvas.get_tk_widget().configure(bg=resolve_color(BG_CARD))
@@ -1838,6 +1840,31 @@ class PLCTrendTool(ctk.CTk):
             for a in targets:
                 a.set_ylabel("Value", fontsize=10, color=text)
 
+    def _apply_chart_bg(self):
+        """Apply per-tag background colors to chart axes (overrides default theme bg)."""
+        if not self._chart_bg:
+            return
+        tags = self._get_ordered_tags()
+        if not tags:
+            return
+        if self._isolated_mode and len(self.axes) > 1:
+            # Isolated mode — each ax maps to a tag
+            display_tags = tags
+            if self._fullscreen_tag and self._fullscreen_tag in tags:
+                display_tags = [self._fullscreen_tag]
+            for i, ax in enumerate(self.axes):
+                if i < len(display_tags):
+                    bg = self._chart_bg.get(display_tags[i])
+                    if bg:
+                        ax.set_facecolor(bg)
+        else:
+            # Overlay mode — single ax, use first tag's bg that has one set
+            for tag in tags:
+                bg = self._chart_bg.get(tag)
+                if bg:
+                    self.axes[0].set_facecolor(bg)
+                    break
+
     # == TAG ORDER & LINE PROPERTIES ==
     def _get_ordered_tags(self):
         """Return tags in current display order.
@@ -2024,11 +2051,11 @@ class PLCTrendTool(ctk.CTk):
     LINE_WIDTHS = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0]
 
     def _show_line_properties(self, tags_to_edit):
-        """Open a dialog to edit line color, width, and style for the given tags."""
+        """Open a dialog to edit line color, width, style, and chart background for the given tags."""
         dlg = ctk.CTkToplevel(self)
         dlg.title("Line Properties")
-        width = 400 if len(tags_to_edit) <= 1 else 440
-        height = min(180 + len(tags_to_edit) * 90, 600)
+        width = 420 if len(tags_to_edit) <= 1 else 460
+        height = min(180 + len(tags_to_edit) * 120, 650)
         dlg.geometry(f"{width}x{height}")
         dlg.resizable(False, False)
         dlg.transient(self)
@@ -2049,11 +2076,13 @@ class PLCTrendTool(ctk.CTk):
         scroll.pack(fill="both", expand=True, padx=8, pady=(0, 4))
 
         all_tags = self._get_ordered_tags()
-        tag_edits = {}  # {tag: {"color_var": StringVar, "width_var": StringVar, "style_var": StringVar}}
+        default_bg = resolve_color(BG_INPUT)
+        tag_edits = {}  # {tag: {"color_var": ..., "width_var": ..., "style_var": ..., "bg_var": ...}}
 
         for tag in tags_to_edit:
             idx = all_tags.index(tag) if tag in all_tags else 0
             props = self._get_line_props(tag, idx)
+            current_bg = self._chart_bg.get(tag, "")
 
             card = ctk.CTkFrame(scroll, fg_color=BG_MEDIUM, corner_radius=6)
             card.pack(fill="x", pady=3)
@@ -2067,9 +2096,9 @@ class PLCTrendTool(ctk.CTk):
                          font=(FONT_FAMILY, FONT_SIZE_BODY, "bold"),
                          text_color=TEXT_PRIMARY).pack(side="left")
 
-            # Controls row
+            # Line controls row
             ctrl = ctk.CTkFrame(card, fg_color="transparent")
-            ctrl.pack(fill="x", padx=10, pady=(0, 8))
+            ctrl.pack(fill="x", padx=10, pady=(0, 4))
 
             # Color picker
             ctk.CTkLabel(ctrl, text="Color:", font=(FONT_FAMILY, FONT_SIZE_SMALL),
@@ -2080,17 +2109,18 @@ class PLCTrendTool(ctk.CTk):
                                    activebackground=props["color"], cursor="hand2")
             color_btn.pack(side="left", padx=(4, 12))
 
-            def make_color_picker(btn, var, t=tag):
+            def make_color_picker(btn, var, title, parent_dlg):
                 def pick():
                     from tkinter import colorchooser
                     result = colorchooser.askcolor(
-                        color=var.get(), title=f"Line Color — {t}",
-                        parent=dlg)
+                        color=var.get(), title=title,
+                        parent=parent_dlg)
                     if result and result[1]:
                         var.set(result[1])
                         btn.configure(bg=result[1], activebackground=result[1])
                 return pick
-            color_btn.configure(command=make_color_picker(color_btn, color_var, tag))
+            color_btn.configure(command=make_color_picker(color_btn, color_var,
+                                                          f"Line Color — {tag}", dlg))
 
             # Width dropdown
             ctk.CTkLabel(ctrl, text="Width:", font=(FONT_FAMILY, FONT_SIZE_SMALL),
@@ -2118,10 +2148,39 @@ class PLCTrendTool(ctk.CTk):
                               dropdown_fg_color=BG_INPUT,
                               width=130, height=26).pack(side="left", padx=(4, 0))
 
+            # Background color row
+            bg_row = ctk.CTkFrame(card, fg_color="transparent")
+            bg_row.pack(fill="x", padx=10, pady=(0, 8))
+
+            ctk.CTkLabel(bg_row, text="Chart BG:", font=(FONT_FAMILY, FONT_SIZE_SMALL),
+                         text_color=TEXT_SECONDARY).pack(side="left")
+            bg_var = ctk.StringVar(value=current_bg if current_bg else default_bg)
+            bg_btn = tk.Button(bg_row, width=3, height=1,
+                                bg=current_bg if current_bg else default_bg,
+                                relief="solid", bd=1,
+                                activebackground=current_bg if current_bg else default_bg,
+                                cursor="hand2")
+            bg_btn.pack(side="left", padx=(4, 8))
+            bg_btn.configure(command=make_color_picker(bg_btn, bg_var,
+                                                        f"Chart Background — {tag}", dlg))
+
+            # Reset BG button
+            def make_reset_bg(btn, var, def_bg=default_bg):
+                def reset():
+                    var.set("")
+                    btn.configure(bg=def_bg, activebackground=def_bg)
+                return reset
+            tk.Button(bg_row, text="Reset", font=(FONT_FAMILY, FONT_SIZE_SMALL - 1),
+                      bg=resolve_color(BG_CARD), fg=resolve_color(TEXT_MUTED),
+                      activebackground=resolve_color(BG_CARD_HOVER),
+                      bd=1, relief="solid", padx=4, pady=0, cursor="hand2",
+                      command=make_reset_bg(bg_btn, bg_var)).pack(side="left")
+
             tag_edits[tag] = {
                 "color_var": color_var,
                 "width_var": width_var,
                 "style_var": style_var,
+                "bg_var": bg_var,
             }
 
         def apply_and_close():
@@ -2139,6 +2198,15 @@ class PLCTrendTool(ctk.CTk):
                     self.lines[tag].set_linewidth(w)
                     self.lines[tag].set_linestyle(style)
                     self.lines[tag].set_label(tag)
+                # Apply background color
+                bg_val = edits["bg_var"].get()
+                if bg_val and bg_val != default_bg:
+                    self._chart_bg[tag] = bg_val
+                else:
+                    self._chart_bg.pop(tag, None)
+            # Re-apply backgrounds to axes
+            self._style_chart_axes()
+            self._apply_chart_bg()
             for ax in self.axes:
                 leg = ax.get_legend()
                 if leg:
@@ -2239,6 +2307,7 @@ class PLCTrendTool(ctk.CTk):
 
         self._style_chart()
         self._style_chart_axes()
+        self._apply_chart_bg()
 
         # Apply time window
         has_data = chart_data and any(times for times, _ in chart_data.values())
@@ -2771,7 +2840,13 @@ class PLCTrendTool(ctk.CTk):
 
     def _on_chart_mouse_leave(self, event):
         """Remove cursor elements when mouse leaves the chart area."""
+        # Save axis limits before removing artists to prevent auto-rescale
+        saved_limits = [(a.get_xlim(), a.get_ylim()) for a in self.axes]
         self._clear_cursor_elements()
+        # Restore limits so chart doesn't jump
+        for a, (xl, yl) in zip(self.axes, saved_limits):
+            a.set_xlim(xl)
+            a.set_ylim(yl)
         try: self.canvas.draw_idle()
         except Exception: pass
 
@@ -3011,6 +3086,7 @@ class PLCTrendTool(ctk.CTk):
         self.tag_data_types.clear()
         self._tag_scales.clear()
         self._line_props.clear()
+        self._chart_bg.clear()
         self._tag_order.clear()
         self._fullscreen_tag = None
         self._inspect_time = None
@@ -3813,6 +3889,7 @@ class PLCTrendTool(ctk.CTk):
         self.tag_data_types.clear()
         self._tag_scales.clear()
         self._line_props.clear()
+        self._chart_bg.clear()
         self._tag_order.clear()
         self._fullscreen_tag = None
         self._inspect_time = None
@@ -3991,6 +4068,7 @@ class PLCTrendTool(ctk.CTk):
         self._apply_treeview_style()
         self._style_chart()
         self._style_chart_axes()  # styles all axes
+        self._apply_chart_bg()
         # Update plain tk.Frame wrappers that don't auto-theme
         if hasattr(self, "_toolbar_frame"):
             tb_bg = resolve_color(BG_MEDIUM)
